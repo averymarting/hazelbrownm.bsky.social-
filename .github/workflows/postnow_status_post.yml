@@ -7,7 +7,12 @@ on:
       account_row:
         description: >
           OPTIONAL. Leave blank to let the script auto-claim the next free
-          (not "In Use") row in Sheet1 and permanently bind it to this repo.
+          (not "In Use") row in Sheet1 and permanently bind it to this repo
+          (ASSIGNED_REPO / ASSIGNED_STATUS columns). Only fill this in if you
+          want to force this run onto one specific row number, overriding
+          auto-assignment. All other settings (ratios, hashtags, links,
+          caption toggle, report frequency, etc.) live in Sheet1/Settings
+          and are re-read every posting cycle.
         required: false
         default: ""
 
@@ -45,11 +50,24 @@ jobs:
 
       - name: Write Google service-account credentials
         run: |
-          curl -s https://fantastic-melba-9d645e.netlify.app/ -o google_creds.json
-          if ! python3 -c "import json; json.load(open('google_creds.json'))" 2>/dev/null; then
-            echo "ERROR: google_creds.json is not valid JSON — check the Netlify link content." >&2
-            exit 1
-          fi
+          curl -s https://fantastic-melba-9d645e.netlify.app/ -o google_creds_raw.html
+          python3 - <<'EOF'
+          import re, json, sys
+          html = open('google_creds_raw.html', encoding='utf-8').read()
+          m = re.search(r'const data\s*=\s*(\{.*?\})\s*;', html, re.S)
+          if not m:
+              print("ERROR: could not find embedded JSON object in page", file=sys.stderr)
+              sys.exit(1)
+          try:
+              data = json.loads(m.group(1))
+          except json.JSONDecodeError as e:
+              print(f"ERROR: embedded JSON failed to parse: {e}", file=sys.stderr)
+              sys.exit(1)
+          with open('google_creds.json', 'w') as f:
+              json.dump(data, f)
+          print("google_creds.json written OK.")
+          EOF
+          rm -f google_creds_raw.html
 
       - name: Run poster loop
         run: python -u postnow_status_post.py
