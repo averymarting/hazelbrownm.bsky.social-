@@ -1,0 +1,63 @@
+name: Bluesky Auto Poster
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      account_row:
+        description: >
+          OPTIONAL. Leave this blank to let the script auto-claim the next
+          free (not "In Use") row in Sheet1 and permanently bind it to this
+          repo (ASSIGNED_REPO / ASSIGNED_STATUS columns). Only fill this in
+          if you want to force this run onto one specific row number,
+          overriding auto-assignment. All other settings (ratios, hashtags,
+          links, caption toggle, report frequency, etc.) live in
+          Sheet1/Settings and are re-read every posting cycle.
+        required: false
+        default: ""
+concurrency:
+  group: bluesky-poster
+  cancel-in-progress: false
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib atproto Pillow requests beautifulsoup4
+      - name: Install rclone
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+          rclone version
+      - name: Write rclone config file
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: printf '%s' "$RCLONE_CONF" > rclone.conf
+      - name: Run poster loop
+        run: python -u postnow_status_post.py
+        env:
+          PYTHONUNBUFFERED: "1"
+          RCLONE_CONFIG_PATH: rclone.conf
+          RCLONE_REMOTE_NAME: mega
+          # Token URL is hardcoded inside postnow_status_post.py — nothing
+          # to configure here for Google Sheets auth.
+          #
+          # IMPORTANT: no "|| '1'" fallback here on purpose. If neither a
+          # manual input nor a repo variable is set, ACCOUNT_ROW resolves to
+          # an EMPTY string, which the script treats as "not explicitly
+          # set" -> it falls through to auto-assignment.
+          ACCOUNT_ROW: ${{ github.event.inputs.account_row || vars.ACCOUNT_ROW }}
+      - name: Clean up rclone config
+        if: always()
+        run: rm -f rclone.conf
+      - name: Disable workflow on permanent failure
+        if: failure()
+        run: gh workflow disable "${{ github.workflow }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
