@@ -11,7 +11,7 @@ import uuid
 import requests
 from bs4 import BeautifulSoup
 from googleapiclient.discovery import build
-from google.auth.transport.requests import Request
+from google.oauth2.service_account import Credentials
 from atproto import Client
 from atproto_client.utils import TextBuilder
 
@@ -91,11 +91,7 @@ ACCOUNT_ROW = get_int_env("ACCOUNT_ROW", 1)   # 1-based data row (header is row 
 RCLONE_CONFIG_PATH = get_env("RCLONE_CONFIG_PATH", required=False) or "rclone.conf"
 RCLONE_REMOTE_NAME = get_env("RCLONE_REMOTE_NAME", required=False) or "mega"
 
-# ── Google token source ─────────────────────────────────────────────────────
-# Credentials are scraped live from this page instead of a GitHub secret.
-DEFAULT_GOOGLE_TOKEN_URL  = "https://sprightly-jalebi-93b4cc.netlify.app/"
-GOOGLE_TOKEN_URL          = get_env("GOOGLE_TOKEN_URL", required=False) or DEFAULT_GOOGLE_TOKEN_URL
-GOOGLE_TOKEN_SHARED_TOKEN = get_env("GOOGLE_TOKEN_SHARED_TOKEN", required=False)
+SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -105,7 +101,7 @@ GOOGLE_TOKEN_SHARED_TOKEN = get_env("GOOGLE_TOKEN_SHARED_TOKEN", required=False)
 # Master sheet: Sheet1 = per-account credentials, Settings = shared live
 # knobs (image/video ratio, hashtags, link, caption toggle, report freq,
 # etc.), Report = simplified one-row-per-check-in report.
-MASTER_SHEET_ID = "1zkyUbtpItYgw3eY1tN084PO17Y-uNBCQ5cENUK3u4rU"
+MASTER_SHEET_ID = "1d1ua2bzBt94omZxYgfwZhSJ94PJwAzc6clWpSVumebw"
 CREDS_TAB       = "Sheet1"
 SETTINGS_TAB    = "Settings"
 REPORT_TAB      = "Report"
@@ -115,7 +111,7 @@ REPORT_TAB      = "Report"
 REPORT_HEADER = ["Timestamp (UTC)", "Handle", "Followers", "Gained", "Top Post", "Engagement", "Status"]
 
 # Post-plan sheet (separate spreadsheet) — File Name + Caption + Status
-POST_PLAN_SHEET_ID  = "1C28ZFsI58AKC4gWfiKLoQgpRTrVpBD_O0f9f7wsSNcM/edit"
+POST_PLAN_SHEET_ID  = "1juum0RextNq44mrBN1Uu7ceSZA2V4Tmb9_oly3EORmA"
 POSTED_STATUS_VALUE = "posted"
 
 ASSIGN_STATUS_IN_USE = "In Use"
@@ -125,59 +121,17 @@ _MENTION_RE = re.compile(r"@\S+")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  GOOGLE CREDENTIALS (Sheets only — Drive is no longer used, media now
-#  lives on Mega.nz)
+#  GOOGLE CREDENTIALS (service account — same one used by the Bluesky
+#  scraper and image scraper scripts. Needs Editor access on BOTH the
+#  master sheet and the post-plan sheet.)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _scrape_google_token(url):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
-    if GOOGLE_TOKEN_SHARED_TOKEN:
-        headers["Authorization"] = f"Bearer {GOOGLE_TOKEN_SHARED_TOKEN}"
-
-    resp = requests.get(url, headers=headers, timeout=15)
-    resp.raise_for_status()
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    for script in soup.find_all("script"):
-        if script.string and "ya29" in script.string and "token" in script.string:
-            m = re.search(r"const data = (\{.*?\});", script.string, re.DOTALL)
-            if m:
-                return json.loads(m.group(1))
-
-    pre = soup.find("pre")
-    if pre and pre.text.strip():
-        return json.loads(pre.text.strip())
-
-    raise RuntimeError(f"Could not extract a token JSON blob from {url}")
-
-
-def get_creds():
-    from google.oauth2.credentials import Credentials
-
-    if GOOGLE_TOKEN_URL:
-        try:
-            info = _scrape_google_token(GOOGLE_TOKEN_URL)
-        except Exception as exc:
-            raise RuntimeError(
-                f"Failed to scrape Google token from GOOGLE_TOKEN_URL ({GOOGLE_TOKEN_URL}): {exc}"
-            ) from exc
-    else:
-        raw = get_env("GOOGLE_OAUTH_CREDENTIALS")
-        try:
-            info = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("GOOGLE_OAUTH_CREDENTIALS is not valid JSON.") from exc
-
-    creds = Credentials.from_authorized_user_info(info)
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-    return creds
-
 def get_sheets_service():
-    return build("sheets", "v4", credentials=get_creds())
+    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "google_creds.json")
+    if not os.path.exists(creds_path):
+        raise RuntimeError(f"Google credentials file not found at {creds_path}")
+    creds = Credentials.from_service_account_file(creds_path, scopes=SHEETS_SCOPES)
+    return build("sheets", "v4", credentials=creds)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -286,6 +240,9 @@ def _claim_account_row(service, data_idx, repo_idx, status_idx, at_idx):
 #  BSKY_HANDLE | BSKY_APP_PW | LINK_URL | LINK_DISPLAY_TEXT | HASHTAGS |
 #  MEGA_UPLOAD_FOLDER | MEGA_PROCESSED_FOLDER |
 #  LOCKED_BY | LOCKED_AT   (optional) |
+#  ACCOUNT_STATUS | ACCOUNT_STATUS_AT   (optional — auto-updated: "Active"
+#                         after every successful login, or a ban/auth-fail
+#                         reason if the account gets taken down) |
 #  ASSIGNED_REPO | ASSIGNED_STATUS | ASSIGNED_AT   (optional) |
 #  POST_PLAN_SHEET_NAME  (optional — set a per-account post-plan tab name;
 #                         falls back to the Settings tab value, then "Sheet1")
@@ -304,6 +261,8 @@ CREDS_RANGE = f"{CREDS_TAB}!A:Z"
 _account_config         = None
 _creds_lock_col_by      = None
 _creds_lock_col_at      = None
+_creds_status_col       = None
+_creds_status_at_col    = None
 _global_settings_cache  = None
 
 DEFAULT_LOOP_INTERVAL_SECONDS = 1800
@@ -335,7 +294,7 @@ def load_global_settings(force_refresh=False):
 
 
 def load_account_config(force_refresh=False):
-    global _account_config, _creds_lock_col_by, _creds_lock_col_at
+    global _account_config, _creds_lock_col_by, _creds_lock_col_at, _creds_status_col, _creds_status_at_col
 
     if _account_config is not None and not force_refresh:
         return _account_config
@@ -373,6 +332,8 @@ def load_account_config(force_refresh=False):
 
     _creds_lock_col_by = header.index("LOCKED_BY") if "LOCKED_BY" in header else None
     _creds_lock_col_at = header.index("LOCKED_AT") if "LOCKED_AT" in header else None
+    _creds_status_col    = header.index("ACCOUNT_STATUS") if "ACCOUNT_STATUS" in header else None
+    _creds_status_at_col = header.index("ACCOUNT_STATUS_AT") if "ACCOUNT_STATUS_AT" in header else None
 
     shared = load_global_settings(force_refresh)
     def setting(key):
@@ -417,6 +378,7 @@ def load_account_config(force_refresh=False):
 
         "locked_by": col("LOCKED_BY"),
         "locked_at": col("LOCKED_AT"),
+        "account_status": col("ACCOUNT_STATUS"),
     }
 
     if not cfg["handle"]:
@@ -487,6 +449,34 @@ def try_acquire_account_lock():
     return True
 
 
+def _write_account_status(status):
+    """Writes a human-readable status directly onto this account's own
+    Sheet1 row (e.g. 'Active', 'Banned', 'Auth Failed'), so you can see at
+    a glance which accounts need attention without digging through the
+    Report tab. No-op if the ACCOUNT_STATUS column doesn't exist yet."""
+    global _account_config
+    if _creds_status_col is None:
+        print("Note: no ACCOUNT_STATUS column in Sheet1 — add one to track per-row status.")
+        return
+    try:
+        service   = get_sheets_service()
+        sheet_row = ACCOUNT_ROW + 1
+        status_col = _col_letter(_creds_status_col)
+        data = [{"range": f"{CREDS_TAB}!{status_col}{sheet_row}", "values": [[status]]}]
+        if _creds_status_at_col is not None:
+            at_col = _col_letter(_creds_status_at_col)
+            data.append({"range": f"{CREDS_TAB}!{at_col}{sheet_row}", "values": [[_now_str()]]})
+        service.spreadsheets().values().batchUpdate(
+            spreadsheetId=MASTER_SHEET_ID,
+            body={"valueInputOption": "RAW", "data": data},
+        ).execute()
+        if _account_config:
+            _account_config["account_status"] = status
+        print(f"Sheet1 ACCOUNT_STATUS set to '{status}' for row {ACCOUNT_ROW}.")
+    except Exception as exc:
+        print(f"Warning: could not update ACCOUNT_STATUS: {exc}")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  TEXT HELPERS (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -510,6 +500,7 @@ def print_config_summary():
     cfg = _cfg()
     print("── Run config (live from 'Settings' tab + Sheet1, re-checked every cycle) ──")
     print(f"  Account row:              {cfg['row_num']}  ({_posting_handle()})")
+    print(f"  Account status:           {cfg.get('account_status') or '(not set)'}")
     print(f"  Mega upload folder:       {cfg['mega_upload_folder'] or '(not set!)'}")
     print(f"  Mega processed folder:    {cfg['mega_processed_folder'] or '(not set!)'}")
     print(f"  Post link:                {cfg['link_display_text']} -> {cfg['link_url']}")
@@ -529,7 +520,7 @@ def print_config_summary():
         print(f"  Top posts combined:       {cfg['top_posts_count']}")
         print(f"  Scan last N posts:        {cfg['top_posts_within']}")
     print(f"  Post-plan tab:            {cfg['post_plan_sheet_name']}")
-    print(f"  Google token source:      {'scraped from GOOGLE_TOKEN_URL' if GOOGLE_TOKEN_URL else 'GOOGLE_OAUTH_CREDENTIALS secret'}")
+    print(f"  Google auth:              service account (GOOGLE_APPLICATION_CREDENTIALS)")
     if _creds_lock_col_by is not None:
         print(f"  Cross-repo lock:          enabled (owner={cfg.get('locked_by') or '—'}, "
               f"last heartbeat={cfg.get('locked_at') or '—'})")
@@ -1143,6 +1134,8 @@ def run_once():
             ) from exc
         raise
 
+    _write_account_status("Active")
+
     if cfg["enable_report"]:
         run_report(client, handle, cfg)
 
@@ -1224,7 +1217,14 @@ def main():
                        if "Auth failed" in err_str or "app password" in err_str
                        else "⛔ ACCOUNT TAKEN DOWN / BANNED")
             print(f"\n{'='*60}\n{err_str}\n→ {reason}\n{'='*60}\n")
+            _write_account_status(reason)
             log_account_problem(handle, status=reason)
+            # Marker file, checked by the workflow's disable step — this
+            # specifically means "this account is done, stop scheduling
+            # runs for it", as opposed to a transient failure that should
+            # just retry next scheduled run.
+            with open("ACCOUNT_BANNED", "w") as f:
+                f.write(f"{handle}: {reason}\n")
             sys.exit(1)
         except Exception as exc:
             print(f"Error during cycle: {exc}")
