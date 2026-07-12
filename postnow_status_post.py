@@ -101,7 +101,7 @@ SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 # Master sheet: Sheet1 = per-account credentials, Settings = shared live
 # knobs (image/video ratio, hashtags, link, caption toggle, report freq,
 # etc.), Report = simplified one-row-per-check-in report.
-MASTER_SHEET_ID = "1d1ua2bzBt94omZxYgfwZhSJ94PJwAzc6clWpSVumebw"
+MASTER_SHEET_ID = "1zkyUbtpItYgw3eY1tN084PO17Y-uNBCQ5cENUK3u4rU"
 CREDS_TAB       = "Sheet1"
 SETTINGS_TAB    = "Settings"
 REPORT_TAB      = "Report"
@@ -111,7 +111,7 @@ REPORT_TAB      = "Report"
 REPORT_HEADER = ["Timestamp (UTC)", "Handle", "Followers", "Gained", "Top Post", "Engagement", "Status"]
 
 # Post-plan sheet (separate spreadsheet) — File Name + Caption + Status
-POST_PLAN_SHEET_ID  = "1juum0RextNq44mrBN1Uu7ceSZA2V4Tmb9_oly3EORmA"
+POST_PLAN_SHEET_ID  = "1C28ZFsI58AKC4gWfiKLoQgpRTrVpBD_O0f9f7wsSNcM"
 POSTED_STATUS_VALUE = "posted"
 
 ASSIGN_STATUS_IN_USE = "In Use"
