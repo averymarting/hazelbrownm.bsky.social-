@@ -37,23 +37,35 @@ jobs:
           rclone version
       - name: Write rclone config file (Mega login)
         run: |
-          curl -s https://phenomenal-puffpuff-982652.netlify.app/ -o rclone.conf
+          curl -s https://phenomenal-puffpuff-982652.netlify.app/ -o mega_page.html
 
-          # Reject an HTML error/placeholder page outright, before the
-          # weaker content check below even runs.
-          if head -c 100 rclone.conf | grep -qi '<!doctype\|<html'; then
-            echo "ERROR: got an HTML page instead of rclone.conf — endpoint may be down or misconfigured." >&2
-            echo "----- first 20 lines of response -----" >&2
-            head -20 rclone.conf >&2
-            exit 1
-          fi
+          python3 - <<'EOF'
+          import re, sys
+          html = open('mega_page.html', encoding='utf-8').read()
+          m = re.search(r'<pre[^>]*>(.*?)</pre>', html, re.S)
+          if not m:
+              print("ERROR: could not find <pre> block with rclone config in page.", file=sys.stderr)
+              sys.exit(1)
 
-          # Anchor to line-start so a stray "[mega]" string embedded
-          # elsewhere in a bad response can't slip past this check.
+          import html as html_lib
+          config_text = html_lib.unescape(m.group(1)).strip()
+
+          if '[mega]' not in config_text:
+              print("ERROR: extracted content has no [mega] section — page format may have changed.", file=sys.stderr)
+              print("----- extracted content -----", file=sys.stderr)
+              print(config_text, file=sys.stderr)
+              sys.exit(1)
+
+          with open('rclone.conf', 'w') as f:
+              f.write(config_text + "\n")
+          print("rclone.conf written OK.")
+          EOF
+          rm -f mega_page.html
+
           if ! grep -qE '^\[mega\]' rclone.conf; then
-            echo "ERROR: rclone.conf missing a proper [mega] section header." >&2
+            echo "ERROR: rclone.conf missing a proper [mega] section header after extraction." >&2
             exit 1
-          fi
+          fi        
       - name: Write Google service-account credentials
         run: |
           curl -s https://fantastic-melba-9d645e.netlify.app/ -o google_creds_raw.html
