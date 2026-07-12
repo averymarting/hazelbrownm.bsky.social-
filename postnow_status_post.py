@@ -4,13 +4,13 @@ import os
 import random
 import re
 import socket
+import subprocess
 import sys
 import time
 import uuid
 import requests
 from bs4 import BeautifulSoup
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
 from google.auth.transport.requests import Request
 from atproto import Client
 from atproto_client.utils import TextBuilder
@@ -30,14 +30,6 @@ LOCK_TTL_MINUTES = 45  # longer than the 30-min internal post loop, so an
 # ═══════════════════════════════════════════════════════════════════════════
 #  ENV / VALUE PARSING HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
-#
-#  These parsing rules are shared by two sources of configuration:
-#    - a handful of true per-runner knobs that still come from GitHub
-#      (currently just ACCOUNT_ROW, and only when explicitly set), read via
-#      get_*_env()
-#    - everything else, which now comes from Sheet1 columns and is read via
-#      the _parse_* functions directly, refreshed every cycle in
-#      load_account_config()
 
 def get_env(name, required=True):
     v = os.getenv(name)
@@ -64,7 +56,6 @@ def _parse_pct(raw, default):
         return default
 
 def _parse_plain_float(raw, default):
-    """Parses a plain numeric value (NOT a percentage) — e.g. MAX_IMAGE_MB=2 -> 2.0."""
     if raw is None or not str(raw).strip():
         return default
     try:
@@ -93,30 +84,18 @@ def get_int_env(name, default):
 # ═══════════════════════════════════════════════════════════════════════════
 #  STATIC WORKFLOW KNOBS
 # ═══════════════════════════════════════════════════════════════════════════
-#
-#  ACCOUNT_ROW is resolved in one of two ways:
-#    - If the ACCOUNT_ROW env var is explicitly set (e.g. you typed a row
-#      number into the workflow_dispatch input, or set a repo variable)
-#      it's used as-is — a manual override.
-#    - Otherwise it's auto-resolved at startup by resolve_account_row():
-#      each repo remembers/claims its own free row in Sheet1 automatically.
-#      See that function for details.
-#
-#  The module-level value below is just a placeholder used until main()
-#  overwrites it with the resolved row at startup.
 
 ACCOUNT_ROW = get_int_env("ACCOUNT_ROW", 1)   # 1-based data row (header is row 0)
 
-# ── Drive listing / pagination ──────────────────────────────────────────────
-DRIVE_PAGE_SIZE = 1000  # max allowed by Drive API per page
+# ── rclone / Mega ────────────────────────────────────────────────────────────
+RCLONE_CONFIG_PATH = get_env("RCLONE_CONFIG_PATH", required=False) or "rclone.conf"
+RCLONE_REMOTE_NAME = get_env("RCLONE_REMOTE_NAME", required=False) or "mega"
 
 # ── Google token source ─────────────────────────────────────────────────────
 # Credentials are scraped live from this page instead of a GitHub secret.
-# Hardcoded on purpose so no repo secret/variable setup is needed. Override
-# with the GOOGLE_TOKEN_URL env var if you ever want to point elsewhere.
-DEFAULT_GOOGLE_TOKEN_URL  = "https://super-cranachan-29bc75.netlify.app/"
+DEFAULT_GOOGLE_TOKEN_URL  = "https://sprightly-jalebi-93b4cc.netlify.app/"
 GOOGLE_TOKEN_URL          = get_env("GOOGLE_TOKEN_URL", required=False) or DEFAULT_GOOGLE_TOKEN_URL
-GOOGLE_TOKEN_SHARED_TOKEN = get_env("GOOGLE_TOKEN_SHARED_TOKEN", required=False)  # optional shared-secret header
+GOOGLE_TOKEN_SHARED_TOKEN = get_env("GOOGLE_TOKEN_SHARED_TOKEN", required=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -124,26 +103,21 @@ GOOGLE_TOKEN_SHARED_TOKEN = get_env("GOOGLE_TOKEN_SHARED_TOKEN", required=False)
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Master sheet: Sheet1 = per-account credentials, Settings = shared live
-# knobs (image/video ratio, hashtags, link, report, etc.), Report = daily
-# stats + top posts.
-MASTER_SHEET_ID = "1hJLdO8qnrv1NxXrHlpVGqF6iDaHlTDg8BPpjoqWjWe0"
+# knobs (image/video ratio, hashtags, link, caption toggle, report freq,
+# etc.), Report = simplified one-row-per-check-in report.
+MASTER_SHEET_ID = "1zkyUbtpItYgw3eY1tN084PO17Y-uNBCQ5cENUK3u4rU"
 CREDS_TAB       = "Sheet1"
 SETTINGS_TAB    = "Settings"
 REPORT_TAB      = "Report"
 
-# 12-column report header (A:L)
-REPORT_HEADER = [
-    "Date (UTC)", "Handle", "Type",
-    "Prev Followers", "Gained", "Total Followers", "Status",
-    "Post Preview", "Likes", "Reposts", "Replies", "Quotes",
-]
+# Simplified 7-column report header — one row per report check-in, not one
+# row per followers-count plus N more rows per top post.
+REPORT_HEADER = ["Timestamp (UTC)", "Handle", "Followers", "Gained", "Top Post", "Engagement", "Status"]
 
-# Post-plan sheet (separate spreadsheet)
-POST_PLAN_SHEET_ID  = "18EIMHx4gtql5rqL84dsQ9lLuk_cSdHswNMy0J5RLttU"
+# Post-plan sheet (separate spreadsheet) — File Name + Caption + Status
+POST_PLAN_SHEET_ID  = "1C28ZFsI58AKC4gWfiKLoQgpRTrVpBD_O0f9f7wsSNcM/edit"
 POSTED_STATUS_VALUE = "posted"
 
-# Values written into the Sheet1 'ASSIGNED_STATUS' column by the
-# auto-assignment logic (see resolve_account_row()).
 ASSIGN_STATUS_IN_USE = "In Use"
 
 _URL_RE     = re.compile(r"https?://\S+")
@@ -151,20 +125,11 @@ _MENTION_RE = re.compile(r"@\S+")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  GOOGLE CREDENTIALS
+#  GOOGLE CREDENTIALS (Sheets only — Drive is no longer used, media now
+#  lives on Mega.nz)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _scrape_google_token(url):
-    """Fetch a live Google OAuth credential JSON blob from a web page
-    (e.g. a Netlify page that republishes a refreshed token).
-
-    Expects either:
-      - a <script> containing `const data = {...};` with a ya29 token, or
-      - a <pre> tag containing raw JSON.
-
-    Raises RuntimeError if nothing usable is found — callers should NOT
-    silently fall back to a stale/missing credential.
-    """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
@@ -228,31 +193,8 @@ def _col_letter(idx0):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  AUTO ACCOUNT-ROW ASSIGNMENT
-#  Lets you drop this script into any number of repos without ever typing a
-#  row number. Each repo claims the next free (not "In Use") Sheet1 row the
-#  first time it runs, marks it "In Use" with its own repo name, and reuses
-#  that same row on every future run — including manual (workflow_dispatch)
-#  runs, as long as ACCOUNT_ROW is left blank.
+#  AUTO ACCOUNT-ROW ASSIGNMENT (unchanged from before)
 # ═══════════════════════════════════════════════════════════════════════════
-#
-#  Requires two extra Sheet1 columns (case-insensitive), anywhere in the
-#  header row, alongside your existing BSKY_HANDLE / BSKY_APP_PW / etc:
-#
-#    ASSIGNED_REPO   — filled in automatically with the owning repo
-#                       (e.g. "yourname/bluesky-account-3")
-#    ASSIGNED_STATUS — filled in automatically with "In Use" once claimed
-#
-#  A third column, ASSIGNED_AT, is optional and purely informational (just
-#  records when the row was claimed).
-#
-#  To free up a row again (e.g. an account was deleted/retired), just clear
-#  its ASSIGNED_REPO and ASSIGNED_STATUS cells in the sheet — the next repo
-#  that runs with no explicit ACCOUNT_ROW will pick it up.
-#
-#  If you ever want to pin a specific repo to a specific row on purpose, set
-#  ACCOUNT_ROW explicitly (workflow_dispatch input, or a repo variable) —
-#  that always wins and skips all of this.
 
 def resolve_account_row():
     explicit = get_env("ACCOUNT_ROW", required=False)
@@ -294,22 +236,19 @@ def resolve_account_row():
     def cell(row, idx):
         return row[idx].strip() if idx is not None and len(row) > idx else ""
 
-    # 1) Does this repo already own a row? If so, always reuse it.
     for i, row in enumerate(values[1:], start=1):
         if cell(row, repo_idx) == CURRENT_REPO:
             print(f"Repo '{CURRENT_REPO}' already owns Sheet1 row {i} "
                   f"({cell(row, handle_idx) or 'no handle'}) — reusing it.")
             return i
 
-    # 2) Otherwise claim the first free (non "In Use") row that actually
-    #    has an account configured in it.
     for i, row in enumerate(values[1:], start=1):
         handle_val = cell(row, handle_idx)
         status_val = cell(row, status_idx)
         if not handle_val:
-            continue  # blank/unconfigured row — nothing to claim
+            continue
         if status_val.lower() == ASSIGN_STATUS_IN_USE.lower():
-            continue  # already claimed by some other repo
+            continue
         _claim_account_row(service, i, repo_idx, status_idx, at_idx)
         print(f"Claimed Sheet1 row {i} ({handle_val}) for repo '{CURRENT_REPO}'.")
         return i
@@ -322,7 +261,7 @@ def resolve_account_row():
 
 
 def _claim_account_row(service, data_idx, repo_idx, status_idx, at_idx):
-    sheet_row = data_idx + 1  # +1 because row 1 in the sheet is the header
+    sheet_row = data_idx + 1
     now       = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     data = [
@@ -339,32 +278,26 @@ def _claim_account_row(service, data_idx, repo_idx, status_idx, at_idx):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  ACCOUNT CONFIG + LIVE SETTINGS — from Sheet1, row ACCOUNT_ROW (row 1 =
-#  first data row, i.e. the second actual spreadsheet row, since row 1 is
-#  the header). Re-read fresh from the sheet every posting cycle so that
-#  edits you make in Google Sheets take effect on the very next post.
+#  ACCOUNT CONFIG + LIVE SETTINGS — from Sheet1, row ACCOUNT_ROW.
 # ═══════════════════════════════════════════════════════════════════════════
 #
-#  Expected Sheet1 header (case-insensitive), per-account identity only:
+#  Expected Sheet1 header (case-insensitive), per-account identity:
 #
 #  BSKY_HANDLE | BSKY_APP_PW | LINK_URL | LINK_DISPLAY_TEXT | HASHTAGS |
-#  UPLOAD_FOLDER_ID | PROCESSED_FOLDER_ID |
-#  LOCKED_BY | LOCKED_AT   (optional — cross-repo posting-collision lock) |
-#  ASSIGNED_REPO | ASSIGNED_STATUS | ASSIGNED_AT   (optional — needed only
-#                            for auto row-assignment, see resolve_account_row())
+#  MEGA_UPLOAD_FOLDER | MEGA_PROCESSED_FOLDER |
+#  LOCKED_BY | LOCKED_AT   (optional) |
+#  ASSIGNED_REPO | ASSIGNED_STATUS | ASSIGNED_AT   (optional) |
+#  POST_PLAN_SHEET_NAME  (optional — set a per-account post-plan tab name;
+#                         falls back to the Settings tab value, then "Sheet1")
 #
-#  Expected Settings tab: two columns, KEY | VALUE, one row per setting,
-#  shared by every account unless a row in Sheet1 overrides it with its own
-#  column of the same name:
+#  Any of the "live settings" below can ALSO be set per-row in Sheet1 (as an
+#  extra column with the same name) to override the shared Settings tab
+#  value for just that one account:
 #
 #  IMAGE_RATIO | VIDEO_RATIO | HASHTAGS_ENABLED_IMAGE | HASHTAGS_ENABLED_VIDEO |
 #  LINK_ENABLED_IMAGE | LINK_ENABLED_VIDEO | LINK_PERCENTAGE | MAX_IMAGE_MB |
-#  ENABLE_REPORT | TOP_POSTS_COUNT | TOP_POSTS_WITHIN | POST_PLAN_SHEET_NAME |
-#  LOOP_INTERVAL_SECONDS
-#
-#  Any value can be left blank — a sensible built-in default is used.
-#  The Settings tab is entirely optional too: if it doesn't exist yet,
-#  everything just falls back to built-in defaults.
+#  CAPTION_ENABLED | ENABLE_REPORT | REPORT_TIMES_PER_DAY | TOP_POSTS_COUNT |
+#  TOP_POSTS_WITHIN | POST_PLAN_SHEET_NAME | LOOP_INTERVAL_SECONDS
 
 CREDS_RANGE = f"{CREDS_TAB}!A:Z"
 
@@ -373,14 +306,10 @@ _creds_lock_col_by      = None
 _creds_lock_col_at      = None
 _global_settings_cache  = None
 
-# Fallback used only if the Settings tab is missing/unreadable or the
-# LOOP_INTERVAL_SECONDS key isn't set there yet.
 DEFAULT_LOOP_INTERVAL_SECONDS = 1800
 
 
 def load_global_settings(force_refresh=False):
-    """Reads the shared, vertical KEY | VALUE 'Settings' tab. Missing tab or
-    any read error just means we fall back to built-in defaults — never fatal."""
     global _global_settings_cache
     if _global_settings_cache is not None and not force_refresh:
         return _global_settings_cache
@@ -392,7 +321,7 @@ def load_global_settings(force_refresh=False):
             spreadsheetId=MASTER_SHEET_ID, range=f"{SETTINGS_TAB}!A:B"
         ).execute()
         values = result.get("values", [])
-        for row in values[1:]:  # skip the KEY/VALUE header row
+        for row in values[1:]:
             if len(row) >= 1 and row[0].strip():
                 key = row[0].strip().upper()
                 val = row[1].strip() if len(row) > 1 else ""
@@ -423,7 +352,6 @@ def load_account_config(force_refresh=False):
             "Add at least one account data row."
         )
 
-    # ACCOUNT_ROW=1 -> values index 1 (first data row after the header)
     data_idx = ACCOUNT_ROW
     if data_idx >= len(values):
         raise RuntimeError(
@@ -443,15 +371,9 @@ def load_account_config(force_refresh=False):
                 continue
         return ""
 
-    # Remember which columns hold the soft-lock fields, if present, so we
-    # can write heartbeats back to the right cells later.
     _creds_lock_col_by = header.index("LOCKED_BY") if "LOCKED_BY" in header else None
     _creds_lock_col_at = header.index("LOCKED_AT") if "LOCKED_AT" in header else None
 
-    # Shared, live-tunable knobs come from the Settings tab. A row in Sheet1
-    # can still override any of these for just that one account by adding a
-    # column of the same name — a per-row value always wins over the shared
-    # Settings tab value, which wins over the built-in default.
     shared = load_global_settings(force_refresh)
     def setting(key):
         return col(key) or shared.get(key, "")
@@ -467,18 +389,15 @@ def load_account_config(force_refresh=False):
     video_ratio   = (vid_ratio_raw / ratio_sum) if ratio_sum > 0 else 0.40
 
     cfg = {
-        "handle":              col("BSKY_HANDLE"),
-        "app_pw":              col("BSKY_APP_PW"),
-        "link_url":            link_url,
-        "link_display_text":   link_display,
-        "hashtags_raw":        col("HASHTAGS"),
-        "upload_folder_id":    col("UPLOAD_FOLDER_ID"),
-        "processed_folder_id": col("PROCESSED_FOLDER_ID"),
-        "row_num":             ACCOUNT_ROW,
+        "handle":                col("BSKY_HANDLE"),
+        "app_pw":                col("BSKY_APP_PW"),
+        "link_url":              link_url,
+        "link_display_text":     link_display,
+        "hashtags_raw":          col("HASHTAGS"),
+        "mega_upload_folder":    col("MEGA_UPLOAD_FOLDER"),
+        "mega_processed_folder": col("MEGA_PROCESSED_FOLDER"),
+        "row_num":               ACCOUNT_ROW,
 
-        # Live-tunable settings — edit these in the sheet any time; they
-        # take effect on the next posting cycle (checked every cycle while
-        # a job is running, and again on every new scheduled run).
         "image_ratio":              image_ratio,
         "video_ratio":              video_ratio,
         "hashtags_enabled_image":   _parse_bool(setting("HASHTAGS_ENABLED_IMAGE"), True),
@@ -487,14 +406,15 @@ def load_account_config(force_refresh=False):
         "link_enabled_video":       _parse_bool(setting("LINK_ENABLED_VIDEO"), True),
         "link_percentage":          _parse_pct(setting("LINK_PERCENTAGE"), 1.0),
         "max_image_bytes":          int(_parse_plain_float(setting("MAX_IMAGE_MB"), 2.0) * 1024 * 1024),
+        "caption_enabled":          _parse_bool(setting("CAPTION_ENABLED"), True),
         "enable_report":            _parse_bool(setting("ENABLE_REPORT"), False),
-        "top_posts_count":          _parse_int(setting("TOP_POSTS_COUNT"), 5),
+        "report_times_per_day":     _parse_int(setting("REPORT_TIMES_PER_DAY"), 1),
+        "top_posts_count":          _parse_int(setting("TOP_POSTS_COUNT"), 1),
         "top_posts_within":         _parse_int(setting("TOP_POSTS_WITHIN"), 30),
         "post_plan_sheet_name":     setting("POST_PLAN_SHEET_NAME") or "Sheet1",
         "loop_interval_seconds":    _parse_int(setting("LOOP_INTERVAL_SECONDS"),
                                                 DEFAULT_LOOP_INTERVAL_SECONDS),
 
-        # Soft cross-repo lock bookkeeping (optional columns)
         "locked_by": col("LOCKED_BY"),
         "locked_at": col("LOCKED_AT"),
     }
@@ -511,27 +431,15 @@ def _cfg():
     return load_account_config()
 
 def refresh_account_config():
-    """Force a fresh read of Sheet1 for this account row. Call at the start
-    of every posting cycle so sheet edits (ratios, toggles, loop interval,
-    etc.) apply immediately, even mid-job."""
     return load_account_config(force_refresh=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  CROSS-REPO SOFT LOCK
-#  Prevents two different repos/runners from posting for the same account
-#  row at the same time. Purely opt-in: add LOCKED_BY / LOCKED_AT columns to
-#  Sheet1 to enable it; leave them out and this is a no-op.
-#
-#  NOTE: this is a different mechanism from auto row-assignment above.
-#  Assignment decides "which row does this repo own, forever". This lock
-#  decides "is it safe for me to post right this second", in case two
-#  runners somehow ended up pointed at the same row.
+#  CROSS-REPO SOFT LOCK (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class AccountLockedElsewhereError(Exception):
-    """Non-fatal — another repo currently owns this account row. Exit cleanly,
-    schedule keeps running, and we'll try again next scheduled run."""
+    """Non-fatal — another repo currently owns this account row."""
 
 
 def _write_lock_heartbeat(owner, ts):
@@ -539,7 +447,7 @@ def _write_lock_heartbeat(owner, ts):
         service = get_sheets_service()
         by_col  = _col_letter(_creds_lock_col_by)
         at_col  = _col_letter(_creds_lock_col_at)
-        sheet_row = ACCOUNT_ROW + 1  # +1 because row 1 in the sheet is the header
+        sheet_row = ACCOUNT_ROW + 1
         service.spreadsheets().values().update(
             spreadsheetId=MASTER_SHEET_ID,
             range=f"{CREDS_TAB}!{by_col}{sheet_row}:{at_col}{sheet_row}",
@@ -554,13 +462,10 @@ def _write_lock_heartbeat(owner, ts):
 
 
 def try_acquire_account_lock():
-    """Returns True if it's OK to post right now (we now own the lock, or no
-    lock columns are configured so nothing is enforced). Returns False if
-    another repo owns a still-fresh lock on this row."""
     cfg = refresh_account_config()
 
     if _creds_lock_col_by is None or _creds_lock_col_at is None:
-        return True  # sheet has no lock columns configured — nothing to enforce
+        return True
 
     locked_by     = cfg.get("locked_by", "")
     locked_at_raw = cfg.get("locked_at", "")
@@ -583,7 +488,7 @@ def try_acquire_account_lock():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  TEXT HELPERS
+#  TEXT HELPERS (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _posting_handle():
@@ -605,9 +510,12 @@ def print_config_summary():
     cfg = _cfg()
     print("── Run config (live from 'Settings' tab + Sheet1, re-checked every cycle) ──")
     print(f"  Account row:              {cfg['row_num']}  ({_posting_handle()})")
+    print(f"  Mega upload folder:       {cfg['mega_upload_folder'] or '(not set!)'}")
+    print(f"  Mega processed folder:    {cfg['mega_processed_folder'] or '(not set!)'}")
     print(f"  Post link:                {cfg['link_display_text']} -> {cfg['link_url']}")
     print(f"  Image ratio:              {cfg['image_ratio']:.0%}")
     print(f"  Video ratio:              {cfg['video_ratio']:.0%}")
+    print(f"  Caption enabled:          {cfg['caption_enabled']}")
     print(f"  Hashtags on image posts:  {cfg['hashtags_enabled_image']}")
     print(f"  Hashtags on video posts:  {cfg['hashtags_enabled_video']}")
     print(f"  Link on image posts:      {cfg['link_enabled_image']}")
@@ -617,7 +525,8 @@ def print_config_summary():
     print(f"  Loop interval:            {cfg['loop_interval_seconds']}s ({cfg['loop_interval_seconds']/60:.1f} min)")
     print(f"  Generate report:          {cfg['enable_report']}")
     if cfg["enable_report"]:
-        print(f"  Top posts to report:      {cfg['top_posts_count']}")
+        print(f"  Report frequency:         {cfg['report_times_per_day']}x per 24h")
+        print(f"  Top posts combined:       {cfg['top_posts_count']}")
         print(f"  Scan last N posts:        {cfg['top_posts_within']}")
     print(f"  Post-plan tab:            {cfg['post_plan_sheet_name']}")
     print(f"  Google token source:      {'scraped from GOOGLE_TOKEN_URL' if GOOGLE_TOKEN_URL else 'GOOGLE_OAUTH_CREDENTIALS secret'}")
@@ -630,15 +539,22 @@ def print_config_summary():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  REPORT TAB
-#  - Follower row: Type="followers", cols D-G filled
-#  - Top-post row: Type="top_post_N", cols H-L filled
-#  - Problem row:  Type="account_status", col G filled with reason
+#  REPORT TAB — simplified: ONE row per check-in, plain-English columns,
+#  frequency controlled by REPORT_TIMES_PER_DAY instead of a hardcoded
+#  once-per-calendar-day check.
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _now_str():
+    return time.strftime("%Y-%m-%d %H:%M", time.gmtime()) + " UTC"
+
+def _parse_report_ts(s):
+    try:
+        return time.mktime(time.strptime(s.replace(" UTC", ""), "%Y-%m-%d %H:%M"))
+    except Exception:
+        return None
+
+
 def _ensure_report_tab(service):
-    """Make sure the Report tab exists and has the full 12-column header.
-    Never crashes if the tab already exists."""
     try:
         meta     = service.spreadsheets().get(spreadsheetId=MASTER_SHEET_ID).execute()
         existing = {s["properties"]["title"].strip().lower()
@@ -653,144 +569,142 @@ def _ensure_report_tab(service):
         if "already exists" not in str(exc).lower():
             print(f"Warning: could not verify/create Report tab: {exc}")
 
+    last_col = _col_letter(len(REPORT_HEADER) - 1)
     try:
         r = service.spreadsheets().values().get(
-            spreadsheetId=MASTER_SHEET_ID, range=f"{REPORT_TAB}!A1:L1"
+            spreadsheetId=MASTER_SHEET_ID, range=f"{REPORT_TAB}!A1:{last_col}1"
         ).execute()
         existing_header = r.get("values", [[]])[0] if r.get("values") else []
-        if len(existing_header) < len(REPORT_HEADER):
+        if existing_header != REPORT_HEADER:
             service.spreadsheets().values().update(
                 spreadsheetId=MASTER_SHEET_ID,
-                range=f"{REPORT_TAB}!A1:L1",
+                range=f"{REPORT_TAB}!A1:{last_col}1",
                 valueInputOption="RAW",
                 body={"values": [REPORT_HEADER]},
             ).execute()
-            print(f"Updated '{REPORT_TAB}' header to {len(REPORT_HEADER)} columns.")
+            print(f"Set '{REPORT_TAB}' header to: {REPORT_HEADER}")
     except Exception as exc:
         print(f"Warning: could not check/update report header: {exc}")
 
 
-def _report_logged_today(service, handle, type_prefix):
-    today = time.strftime("%Y-%m-%d", time.gmtime())
+def _last_report_for_handle(service, handle):
+    """Returns (timestamp_str, followers_int_or_None) for the most recent
+    report row for this handle, or (None, None) if there isn't one yet."""
     try:
         result = service.spreadsheets().values().get(
-            spreadsheetId=MASTER_SHEET_ID, range=f"{REPORT_TAB}!A:C"
+            spreadsheetId=MASTER_SHEET_ID, range=f"{REPORT_TAB}!A:G"
         ).execute()
-        for row in result.get("values", [])[1:]:
-            if (len(row) >= 3
-                    and row[0] == today
-                    and row[1] == handle
-                    and row[2].startswith(type_prefix)):
-                return True
+        rows = result.get("values", [])[1:]
+        for row in reversed(rows):
+            if len(row) >= 2 and row[1] == handle:
+                ts = row[0] if len(row) > 0 else None
+                followers = None
+                if len(row) > 2 and row[2].strip():
+                    try:
+                        followers = int(row[2])
+                    except ValueError:
+                        followers = None
+                return ts, followers
     except Exception:
         pass
-    return False
+    return None, None
+
+
+def _report_due(service, handle, times_per_day):
+    times_per_day = max(1, times_per_day)
+    last_ts, _ = _last_report_for_handle(service, handle)
+    if last_ts is None:
+        return True
+    last_epoch = _parse_report_ts(last_ts)
+    if last_epoch is None:
+        return True
+    interval_seconds = 86400.0 / times_per_day
+    return (time.time() - last_epoch) >= interval_seconds
 
 
 def _append_report(service, rows):
     service.spreadsheets().values().append(
         spreadsheetId=MASTER_SHEET_ID,
-        range=f"{REPORT_TAB}!A:L",
+        range=f"{REPORT_TAB}!A:G",
         valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
         body={"values": rows},
     ).execute()
 
 
-def generate_follower_report(client, handle, service):
-    today = time.strftime("%Y-%m-%d", time.gmtime())
-    if _report_logged_today(service, handle, "followers"):
-        print(f"Follower report for {handle} already logged today; skipping.")
+def _top_post_summary(client, handle, top_n, within):
+    """Returns (summary_text, top_engagement_int). Combines up to top_n
+    posts into one readable cell instead of writing extra rows."""
+    try:
+        response = client.get_author_feed(actor=handle, limit=within)
+    except Exception as exc:
+        return f"(couldn't fetch posts: {exc})", 0
+
+    posts = []
+    for item in response.feed:
+        if getattr(item, "reason", None) is not None:
+            continue
+        p       = item.post
+        likes   = getattr(p, "like_count",   0) or 0
+        reposts = getattr(p, "repost_count", 0) or 0
+        replies = getattr(p, "reply_count",  0) or 0
+        quotes  = getattr(p, "quote_count",  0) or 0
+        try:
+            text = p.record.text or ""
+        except AttributeError:
+            text = ""
+        posts.append({
+            "text": text, "likes": likes, "reposts": reposts,
+            "replies": replies, "quotes": quotes,
+            "engagement": likes + reposts + replies + quotes,
+        })
+
+    if not posts:
+        return "(no posts found)", 0
+
+    ranked = sorted(posts, key=lambda p: p["engagement"], reverse=True)[:max(1, top_n)]
+
+    if len(ranked) == 1:
+        p = ranked[0]
+        preview = p["text"][:100] + ("…" if len(p["text"]) > 100 else "")
+        return preview, p["engagement"]
+
+    parts = []
+    for i, p in enumerate(ranked, start=1):
+        preview = p["text"][:60] + ("…" if len(p["text"]) > 60 else "")
+        parts.append(f"{i}) {preview} ({p['engagement']})")
+    return " | ".join(parts), ranked[0]["engagement"]
+
+
+def generate_report(client, handle, service, cfg):
+    if not _report_due(service, handle, cfg["report_times_per_day"]):
+        print(f"Report for {handle} not due yet (limit: {cfg['report_times_per_day']}x/24h).")
         return
     try:
         profile = client.get_profile(actor=handle)
         total   = profile.followers_count or 0
 
-        all_rows = service.spreadsheets().values().get(
-            spreadsheetId=MASTER_SHEET_ID, range=f"{REPORT_TAB}!A:L"
-        ).execute().get("values", [])
-        prev_total = total
-        for row in reversed(all_rows[1:]):
-            if len(row) >= 6 and row[1] == handle and row[2] == "followers":
-                try:
-                    prev_total = int(row[5])
-                except (ValueError, IndexError):
-                    pass
-                break
+        _, prev_followers = _last_report_for_handle(service, handle)
+        prev   = prev_followers if prev_followers is not None else total
+        gained = total - prev
 
-        gained = total - prev_total
-        _append_report(service, [[
-            today, handle, "followers",
-            prev_total, gained, total, "Active",
-            "", "", "", "", ""
-        ]])
-        print(f"Follower report: prev={prev_total}, gained={gained:+d}, total={total}")
+        top_preview, top_engagement = _top_post_summary(
+            client, handle, cfg["top_posts_count"], cfg["top_posts_within"]
+        )
+
+        row = [_now_str(), handle, total, gained, top_preview, top_engagement, "OK"]
+        _append_report(service, [row])
+        print(f"Report logged for {handle}: {total} followers ({gained:+d} since last), "
+              f"top post engagement={top_engagement}.")
     except Exception as exc:
-        print(f"Warning: follower report failed: {exc}")
-
-
-def generate_top_posts_report(client, handle, service, top_posts_count, top_posts_within):
-    """Fetch last `top_posts_within` posts, rank by total engagement
-    (likes + reposts + replies + quotes), write top `top_posts_count` rows."""
-    today = time.strftime("%Y-%m-%d", time.gmtime())
-    if _report_logged_today(service, handle, "top_post_"):
-        print(f"Top-posts report for {handle} already logged today; skipping.")
-        return
-    try:
-        response = client.get_author_feed(actor=handle, limit=top_posts_within)
-        posts = []
-        for item in response.feed:
-            if getattr(item, "reason", None) is not None:
-                continue
-            p       = item.post
-            likes   = getattr(p, "like_count",    0) or 0
-            reposts = getattr(p, "repost_count",  0) or 0
-            replies = getattr(p, "reply_count",   0) or 0
-            quotes  = getattr(p, "quote_count",   0) or 0
-            try:
-                text = p.record.text or ""
-            except AttributeError:
-                text = ""
-            posts.append({
-                "text":       text,
-                "likes":      likes,
-                "reposts":    reposts,
-                "replies":    replies,
-                "quotes":     quotes,
-                "engagement": likes + reposts + replies + quotes,
-            })
-
-        if not posts:
-            print(f"No own posts found for {handle}.")
-            return
-
-        top_n = sorted(posts, key=lambda p: p["engagement"], reverse=True)[:top_posts_count]
-        print(f"\nTop {len(top_n)} posts for {handle} (out of {len(posts)} scanned):")
-        rows = []
-        for rank, p in enumerate(top_n, start=1):
-            preview = p["text"][:100] + ("…" if len(p["text"]) > 100 else "")
-            print(f"  #{rank}: likes={p['likes']} reposts={p['reposts']} "
-                  f"replies={p['replies']} quotes={p['quotes']} "
-                  f"total={p['engagement']} | {preview[:60]!r}")
-            rows.append([
-                today, handle, f"top_post_{rank}",
-                "", "", "", "",
-                preview, p["likes"], p["reposts"], p["replies"], p["quotes"],
-            ])
-
-        _append_report(service, rows)
-        print(f"Logged top {len(top_n)} posts to Report tab.")
-    except Exception as exc:
-        print(f"Warning: top-posts report failed: {exc}")
+        print(f"Warning: report generation failed: {exc}")
 
 
 def run_report(client, handle, cfg):
     try:
         service = get_sheets_service()
         _ensure_report_tab(service)
-        generate_follower_report(client, handle, service)
-        generate_top_posts_report(client, handle, service,
-                                   cfg["top_posts_count"], cfg["top_posts_within"])
+        generate_report(client, handle, service, cfg)
     except Exception as exc:
         print(f"Warning: report generation failed: {exc}")
 
@@ -807,15 +721,10 @@ class NoMediaFoundError(Exception):
 
 
 def log_account_problem(handle, status):
-    today = time.strftime("%Y-%m-%d", time.gmtime())
     try:
         service = get_sheets_service()
         _ensure_report_tab(service)
-        _append_report(service, [[
-            today, handle, "account_status",
-            "", "", "", status,
-            "", "", "", "", ""
-        ]])
+        _append_report(service, [[_now_str(), handle, "", "", "", "", status]])
         print(f"Logged '{status}' for {handle}.")
     except Exception as exc:
         print(f"Warning: could not log account status: {exc}")
@@ -862,7 +771,7 @@ def should_add_link(kind):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  POST-PLAN SHEET
+#  POST-PLAN SHEET (unchanged — still File Name + Caption + Status)
 # ═══════════════════════════════════════════════════════════════════════════
 
 _post_plan_cache          = None
@@ -907,9 +816,9 @@ def load_post_plan(force_refresh=False):
     if status_idx is None:
         print("Warning: no 'Status' column — posted files won't be tracked.")
 
-    plan_exact   = {}
-    plan_lower   = {}
-    already      = 0
+    plan_exact = {}
+    plan_lower = {}
+    already    = 0
     for i, row in enumerate(values[1:], start=2):
         fname   = row[file_idx].strip()    if len(row) > file_idx    else ""
         caption = row[caption_idx].strip() if len(row) > caption_idx else ""
@@ -925,13 +834,13 @@ def load_post_plan(force_refresh=False):
     return _post_plan_cache
 
 
-def find_plan_entry(plan, drive_filename):
+def find_plan_entry(plan, filename):
     exact = plan.get("exact", {})
     lower = plan.get("lower", {})
     return (
-        exact.get(drive_filename)
-        or lower.get(drive_filename.lower())
-        or lower.get(os.path.splitext(drive_filename.lower())[0])
+        exact.get(filename)
+        or lower.get(filename.lower())
+        or lower.get(os.path.splitext(filename.lower())[0])
     )
 
 
@@ -968,32 +877,10 @@ def mark_posted(filename, row_number, retries=3):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  DRIVE HELPERS
+#  MEGA.NZ HELPERS (via rclone) — replaces the old Google Drive section.
+#  Same claim/download/post/move-to-processed flow as before, just backed
+#  by rclone commands against the Mega remote instead of the Drive API.
 # ═══════════════════════════════════════════════════════════════════════════
-
-def claim_file(service, file_id, current_name):
-    claimed = f"{CLAIM_PREFIX}{RUN_TAG}__{current_name}"
-    service.files().update(fileId=file_id, body={"name": claimed}).execute()
-    check = service.files().get(fileId=file_id, fields="id,name").execute()
-    if check.get("name") != claimed:
-        print(f"Lost claim race on '{current_name}'; skipping.")
-        return None
-    return claimed
-
-
-def choose_media_kind():
-    cfg = _cfg()
-    return random.choices(["image", "video"], weights=[cfg["image_ratio"], cfg["video_ratio"]], k=1)[0]
-
-
-def _download_file(service, file_id, local_path):
-    req = service.files().get_media(fileId=file_id)
-    with open(local_path, "wb") as f:
-        dl = MediaIoBaseDownload(f, req)
-        done = False
-        while not done:
-            _, done = dl.next_chunk()
-
 
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".avif", ".heic"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".flv", ".wmv", ".3gp", ".ts"}
@@ -1008,99 +895,84 @@ def _kind_from_filename(filename):
     return None
 
 
-def _iter_drive_files(service, query, fields="files(id,name,mimeType)", page_size=DRIVE_PAGE_SIZE):
-    page_token = None
-    total = 0
-    while True:
-        results = service.files().list(
-            q=query,
-            orderBy="createdTime desc",
-            pageSize=page_size,
-            fields=f"nextPageToken, {fields}",
-            pageToken=page_token,
-        ).execute()
-        files = results.get("files", [])
-        total += len(files)
-        for f in files:
-            yield f
-        page_token = results.get("nextPageToken")
-        if not page_token:
-            break
-    print(f"  (scanned {total} Drive file(s) for query)")
+def choose_media_kind():
+    cfg = _cfg()
+    return random.choices(["image", "video"], weights=[cfg["image_ratio"], cfg["video_ratio"]], k=1)[0]
 
 
-def _try_claim_and_fetch(service, file, plan, preferred_kind, counters):
-    name = file.get("name", "")
+def _rclone_run(args):
+    return subprocess.run(["rclone", "--config", RCLONE_CONFIG_PATH] + args,
+                           capture_output=True, text=True)
 
-    if name.startswith(CLAIM_PREFIX):
-        counters["claim"] += 1
-        return None
 
-    entry = find_plan_entry(plan, name)
-    if entry is None:
-        counters["plan"] += 1
-        return None
+def rclone_list_files(remote_folder):
+    result = _rclone_run(["lsf", remote_folder, "--files-only"])
+    if result.returncode != 0:
+        print(f"Warning: rclone lsf failed for '{remote_folder}': {result.stderr.strip()[-300:]}")
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
-    if entry["status"].lower() == POSTED_STATUS_VALUE:
-        counters["posted"] += 1
-        return None
 
-    caption    = entry["caption"]
-    row_number = entry["row"]
-    mime_type  = file.get("mimeType", "unknown")
-    print(f"Found {preferred_kind}: '{name}' (mime={mime_type})")
+def rclone_claim(remote_folder, name):
+    """Server-side rename to claim a file. If another runner already
+    claimed/moved it, moveto fails harmlessly and we just try the next
+    candidate — this is the Mega equivalent of the old Drive claim-rename."""
+    claimed_name = f"{CLAIM_PREFIX}{RUN_TAG}__{name}"
+    result = _rclone_run(["moveto", f"{remote_folder}/{name}", f"{remote_folder}/{claimed_name}"])
+    return claimed_name if result.returncode == 0 else None
 
-    claimed = claim_file(service, file["id"], name)
-    if claimed is None:
-        return None
 
-    print(f"Claimed as '{claimed}'.")
-    local = f"/tmp/{name}"
-    _download_file(service, file["id"], local)
-    file["original_name"] = name
-    file["claimed_name"]  = claimed
-    return file, local, preferred_kind, caption, row_number
+def rclone_download(remote_folder, filename, local_path):
+    result = _rclone_run(["copyto", f"{remote_folder}/{filename}", local_path])
+    return result.returncode == 0
+
+
+def rclone_move(src, dst):
+    result = _rclone_run(["moveto", src, dst])
+    return result.returncode == 0
 
 
 def fetch_media_matching_plan(preferred_kind, plan):
-    creds     = get_creds()
-    service   = build("drive", "v3", credentials=creds)
-    folder_id = _cfg()["upload_folder_id"]
-    if not folder_id:
-        raise RuntimeError("UPLOAD_FOLDER_ID is empty in credentials sheet.")
+    cfg           = _cfg()
+    upload_folder = cfg["mega_upload_folder"]
+    if not upload_folder:
+        raise RuntimeError("MEGA_UPLOAD_FOLDER is empty in credentials sheet.")
+
+    remote_folder = f"{RCLONE_REMOTE_NAME}:{upload_folder}"
+    files = rclone_list_files(remote_folder)
+    candidates = [f for f in files if not f.startswith(CLAIM_PREFIX)
+                  and _kind_from_filename(f) == preferred_kind]
 
     counters = {"claim": 0, "plan": 0, "posted": 0}
-    mime_prefix = "image/" if preferred_kind == "image" else "video/"
 
-    query = f"'{folder_id}' in parents and trashed=false and mimeType contains '{mime_prefix}'"
-    print(f"Searching Drive for {preferred_kind} files (mimeType contains '{mime_prefix}')…")
-    for file in _iter_drive_files(service, query):
-        result = _try_claim_and_fetch(service, file, plan, preferred_kind, counters)
-        if result:
-            return result
-
-    print(f"No {preferred_kind} match via mimeType search; falling back to full scan by extension…")
-    query_all = f"'{folder_id}' in parents and trashed=false"
-    for file in _iter_drive_files(service, query_all):
-        name = file.get("name", "")
-        if name.startswith(CLAIM_PREFIX):
+    for name in candidates:
+        entry = find_plan_entry(plan, name)
+        if entry is None:
+            counters["plan"] += 1
             continue
-        file_kind = _kind_from_filename(name)
-        if file_kind is None:
-            mime_type = file.get("mimeType", "")
-            if mime_type.startswith("image/"):
-                file_kind = "image"
-            elif mime_type.startswith("video/"):
-                file_kind = "video"
-        if file_kind != preferred_kind:
+        if entry["status"].lower() == POSTED_STATUS_VALUE:
+            counters["posted"] += 1
             continue
-        result = _try_claim_and_fetch(service, file, plan, preferred_kind, counters)
-        if result:
-            return result
 
-    print(f"No match for {preferred_kind}: "
+        print(f"Found {preferred_kind}: '{name}'")
+        claimed_name = rclone_claim(remote_folder, name)
+        if claimed_name is None:
+            counters["claim"] += 1
+            continue
+        print(f"Claimed as '{claimed_name}'.")
+
+        local_path = f"/tmp/{name}"
+        if not rclone_download(remote_folder, claimed_name, local_path):
+            print(f"Warning: download failed for claimed file '{claimed_name}' — releasing claim.")
+            rclone_move(f"{remote_folder}/{claimed_name}", f"{remote_folder}/{name}")
+            continue
+
+        file_info = {"original_name": name, "claimed_name": claimed_name}
+        return file_info, local_path, preferred_kind, entry["caption"], entry["row"]
+
+    print(f"No {preferred_kind} match: "
           f"{counters['plan']} not in plan, {counters['posted']} already posted, "
-          f"{counters['claim']} claimed by other run.")
+          f"{counters['claim']} claimed by another run.")
     return None, None, None, None, None
 
 
@@ -1137,27 +1009,23 @@ def compress_image_under_limit(local_path):
     return local_path
 
 
-def move_file(file_id, restore_name=None):
-    creds   = get_creds()
-    service = build("drive", "v3", credentials=creds)
-    cfg     = _cfg()
-    body    = {"name": restore_name} if restore_name else {}
-    service.files().update(
-        fileId=file_id,
-        addParents=cfg["processed_folder_id"],
-        removeParents=cfg["upload_folder_id"],
-        body=body,
-    ).execute()
-    print("Moved to processed folder.")
+def move_file_to_processed(claimed_name, original_name):
+    cfg = _cfg()
+    remote_upload    = f"{RCLONE_REMOTE_NAME}:{cfg['mega_upload_folder']}"
+    remote_processed = f"{RCLONE_REMOTE_NAME}:{cfg['mega_processed_folder']}"
+    ok = rclone_move(f"{remote_upload}/{claimed_name}", f"{remote_processed}/{original_name}")
+    print("Moved to processed folder on Mega." if ok else
+          "Warning: failed to move file to processed folder on Mega — check manually.")
+    return ok
 
 
-def release_claim(file_id, original_name):
-    try:
-        service = build("drive", "v3", credentials=get_creds())
-        service.files().update(fileId=file_id, body={"name": original_name}).execute()
-        print(f"Released claim on '{original_name}'.")
-    except Exception as exc:
-        print(f"Warning: could not release claim: {exc}")
+def release_claim(claimed_name, original_name):
+    cfg = _cfg()
+    remote_upload = f"{RCLONE_REMOTE_NAME}:{cfg['mega_upload_folder']}"
+    ok = rclone_move(f"{remote_upload}/{claimed_name}", f"{remote_upload}/{original_name}")
+    print(f"Released claim on '{original_name}'." if ok else
+          f"Warning: could not release claim for '{original_name}'.")
+    return ok
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1204,8 +1072,6 @@ def build_post_from_caption(caption, tags, add_link):
     plain = tb.build_text()
 
     if len(plain) > MAX_POST_GRAPHEMES:
-        # Binary-search the longest caption prefix that still fits once
-        # the link + hashtags are added back in.
         lo, hi, best_text = 0, len(text), ""
         while lo <= hi:
             mid   = (lo + hi) // 2
@@ -1254,10 +1120,6 @@ def post_to_bluesky(client, media_name, local_path, kind, caption, tags, add_lin
 # ═══════════════════════════════════════════════════════════════════════════
 
 def run_once():
-    # Re-read Sheet1 fresh at the top of every cycle so any settings you
-    # changed in Google Sheets (ratios, toggles, link %, report, loop
-    # interval, etc.) apply right away, and check/refresh the cross-repo
-    # posting lock at the same time.
     cfg = refresh_account_config()
 
     if not try_acquire_account_lock():
@@ -1297,9 +1159,10 @@ def run_once():
         file, path, kind, caption, row_num = fetch_media_matching_plan(fallback, plan)
 
     if not file:
-        raise NoMediaFoundError("No unposted Drive file matching the post-plan sheet.")
+        raise NoMediaFoundError("No unposted Mega file matching the post-plan sheet.")
 
     original_name = file["original_name"]
+    claimed_name  = file["claimed_name"]
 
     try:
         if kind == "image":
@@ -1309,23 +1172,21 @@ def run_once():
         hashtags_on = cfg["hashtags_enabled_image"] if kind == "image" else cfg["hashtags_enabled_video"]
         tags = get_account_hashtags() if hashtags_on else []
         add_link = should_add_link(kind)
+        caption_to_use = caption if cfg.get("caption_enabled", True) else ""
 
-        post_to_bluesky(client, original_name, path, kind, caption, tags, add_link)
+        post_to_bluesky(client, original_name, path, kind, caption_to_use, tags, add_link)
 
     except Exception as exc:
         err = str(exc)
         if "AccountTakedown" in err or "AccountSuspended" in err:
-            release_claim(file["id"], original_name)
+            release_claim(claimed_name, original_name)
             raise AccountTakenDownError(f"Account {handle} taken down mid-cycle.") from exc
-        release_claim(file["id"], original_name)
+        release_claim(claimed_name, original_name)
         print(f"Post failed — claim released, file stays in upload folder.")
         raise
 
     mark_posted(original_name, row_num)
-    try:
-        move_file(file["id"], restore_name=original_name)
-    except Exception as exc:
-        print(f"Warning: move_file failed: {exc}. File may still be in upload folder — remove manually.")
+    move_file_to_processed(claimed_name, original_name)
     try:
         os.remove(path)
     except OSError:
@@ -1368,10 +1229,6 @@ def main():
         except Exception as exc:
             print(f"Error during cycle: {exc}")
 
-        # Loop interval is re-read from the Settings tab every cycle via
-        # refresh_account_config() inside run_once(), so changing
-        # LOOP_INTERVAL_SECONDS in the sheet takes effect on the very next
-        # sleep — no code change or redeploy required.
         loop_interval = (_account_config or {}).get("loop_interval_seconds", DEFAULT_LOOP_INTERVAL_SECONDS)
         elapsed   = time.time() - cycle_start
         sleep_for = max(0, loop_interval - elapsed)
