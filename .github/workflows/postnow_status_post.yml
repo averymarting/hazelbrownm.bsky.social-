@@ -15,11 +15,9 @@ on:
           and are re-read every posting cycle.
         required: false
         default: ""
-
 concurrency:
   group: bluesky-poster
   cancel-in-progress: false
-
 jobs:
   post:
     runs-on: ubuntu-latest
@@ -31,44 +29,63 @@ jobs:
       - uses: actions/setup-python@v4
         with:
           python-version: "3.11"
-
       - name: Install dependencies
         run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib atproto Pillow requests beautifulsoup4
-
       - name: Install rclone
         run: |
           curl https://rclone.org/install.sh | sudo bash
           rclone version
-
       - name: Write rclone config file (Mega login)
         run: |
           curl -s https://phenomenal-puffpuff-982652.netlify.app/ -o rclone.conf
-          if ! grep -q "\[mega\]" rclone.conf; then
-            echo "ERROR: rclone.conf did not contain expected [mega] section — link may be down." >&2
+
+          # Reject an HTML error/placeholder page outright, before the
+          # weaker content check below even runs.
+          if head -c 100 rclone.conf | grep -qi '<!doctype\|<html'; then
+            echo "ERROR: got an HTML page instead of rclone.conf — endpoint may be down or misconfigured." >&2
+            echo "----- first 20 lines of response -----" >&2
+            head -20 rclone.conf >&2
             exit 1
           fi
 
+          # Anchor to line-start so a stray "[mega]" string embedded
+          # elsewhere in a bad response can't slip past this check.
+          if ! grep -qE '^\[mega\]' rclone.conf; then
+            echo "ERROR: rclone.conf missing a proper [mega] section header." >&2
+            exit 1
+          fi
       - name: Write Google service-account credentials
         run: |
           curl -s https://fantastic-melba-9d645e.netlify.app/ -o google_creds_raw.html
+
+          if head -c 100 google_creds_raw.html | grep -qi '<!doctype html>'; then
+            : # expected — this endpoint serves an HTML page with embedded JSON
+          fi
+
           python3 - <<'EOF'
           import re, json, sys
           html = open('google_creds_raw.html', encoding='utf-8').read()
           m = re.search(r'const data\s*=\s*(\{.*?\})\s*;', html, re.S)
           if not m:
-              print("ERROR: could not find embedded JSON object in page", file=sys.stderr)
+              print("ERROR: could not find embedded JSON object in page — endpoint may be down or changed format.", file=sys.stderr)
               sys.exit(1)
           try:
               data = json.loads(m.group(1))
           except json.JSONDecodeError as e:
               print(f"ERROR: embedded JSON failed to parse: {e}", file=sys.stderr)
               sys.exit(1)
+
+          required_keys = {"type", "private_key", "client_email"}
+          missing = required_keys - data.keys()
+          if missing:
+              print(f"ERROR: parsed JSON is missing expected service-account keys: {missing}", file=sys.stderr)
+              sys.exit(1)
+
           with open('google_creds.json', 'w') as f:
               json.dump(data, f)
           print("google_creds.json written OK.")
           EOF
           rm -f google_creds_raw.html
-
       - name: Run poster loop
         run: python -u postnow_status_post.py
         env:
@@ -77,11 +94,9 @@ jobs:
           RCLONE_REMOTE_NAME: mega
           GOOGLE_APPLICATION_CREDENTIALS: google_creds.json
           ACCOUNT_ROW: ${{ github.event.inputs.account_row || vars.ACCOUNT_ROW }}
-
       - name: Clean up secrets
         if: always()
         run: rm -f rclone.conf google_creds.json
-
       - name: Disable workflow on permanent failure
         if: failure()
         run: |
