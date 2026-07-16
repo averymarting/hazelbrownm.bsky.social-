@@ -103,7 +103,7 @@ SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 # knobs (image/video/previewLink ratio, hashtags, link, caption toggle,
 # report freq, etc.), Report = simplified one-row-per-check-in report.
 MASTER_SHEET_ID = "1zkyUbtpItYgw3eY1tN084PO17Y-uNBCQ5cENUK3u4rU"
-CREDS_TAB       = "Sheet1"
+CREDS_TAB       = "Credentials"
 SETTINGS_TAB    = "Settings"
 REPORT_TAB      = "Report"
 
