@@ -9,10 +9,11 @@ import sys
 import time
 import uuid
 import requests
+from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials
-from atproto import Client
+from atproto import Client, models
 from atproto_client.utils import TextBuilder
 
 RUN_TAG      = os.getenv("GITHUB_RUN_ID") or f"{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
@@ -23,8 +24,8 @@ CLAIM_PREFIX = "CLAIMED_"
 #   (b) the *permanent* account-row assignment (ASSIGNED_REPO / ASSIGNED_STATUS
 #       columns) — see resolve_account_row() below.
 CURRENT_REPO     = os.getenv("GITHUB_REPOSITORY") or f"local-{socket.gethostname()}"
-LOCK_TTL_MINUTES = 45  # longer than the 30-min internal post loop, so an
-                        # actively-running job keeps refreshing its own lock
+LOCK_TTL_MINUTES = 45  # longer than the internal post loop, so an actively
+                        # running job keeps refreshing its own lock
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -99,8 +100,8 @@ SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Master sheet: Sheet1 = per-account credentials, Settings = shared live
-# knobs (image/video ratio, hashtags, link, caption toggle, report freq,
-# etc.), Report = simplified one-row-per-check-in report.
+# knobs (image/video/previewLink ratio, hashtags, link, caption toggle,
+# report freq, etc.), Report = simplified one-row-per-check-in report.
 MASTER_SHEET_ID = "1zkyUbtpItYgw3eY1tN084PO17Y-uNBCQ5cENUK3u4rU"
 CREDS_TAB       = "Sheet1"
 SETTINGS_TAB    = "Settings"
@@ -110,20 +111,42 @@ REPORT_TAB      = "Report"
 # row per followers-count plus N more rows per top post.
 REPORT_HEADER = ["Timestamp (UTC)", "Handle", "Followers", "Gained", "Top Post", "Engagement", "Status"]
 
-# Post-plan sheet (separate spreadsheet) — File Name + Caption + Status
+# Post-plan sheet (separate spreadsheet) — File Name + Caption + Status,
+# used for the "image" and "video" post types (Mega-hosted media).
 POST_PLAN_SHEET_ID  = "1C28ZFsI58AKC4gWfiKLoQgpRTrVpBD_O0f9f7wsSNcM"
 POSTED_STATUS_VALUE = "posted"
+
+# LinkPlan sheet — URL + Caption + Status, used for the "previewLink" post
+# type (social-card / link-preview posts, no media file needed). Lives as
+# a tab in the SAME spreadsheet as the post-plan by default — set this to
+# a different spreadsheet ID if you'd rather keep it separate.
+LINK_PLAN_SHEET_ID = POST_PLAN_SHEET_ID
 
 ASSIGN_STATUS_IN_USE = "In Use"
 
 _URL_RE     = re.compile(r"https?://\S+")
 _MENTION_RE = re.compile(r"@\S+")
 
+# Shared, browser-like headers used for the manual link-preview scrape
+# fallback and the thumbnail download.
+REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+CARDYB_EXTRACT_URL = "https://cardyb.bsky.app/v1/extract"
+LINK_PREVIEW_MAX_RETRIES = 3
+LINK_PREVIEW_RETRY_DELAY = 2  # seconds; doubles each retry (2, 4, 8...)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  GOOGLE CREDENTIALS (service account — same one used by the Bluesky
 #  scraper and image scraper scripts. Needs Editor access on BOTH the
-#  master sheet and the post-plan sheet.)
+#  master sheet and the post-plan/link-plan sheet.)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def get_sheets_service():
@@ -147,8 +170,10 @@ def _col_letter(idx0):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  AUTO ACCOUNT-ROW ASSIGNMENT (unchanged from before)
+#  AUTO ACCOUNT-ROW ASSIGNMENT (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════
+
+CREDS_RANGE = f"{CREDS_TAB}!A:Z"
 
 def resolve_account_row():
     explicit = get_env("ACCOUNT_ROW", required=False)
@@ -240,23 +265,29 @@ def _claim_account_row(service, data_idx, repo_idx, status_idx, at_idx):
 #  BSKY_HANDLE | BSKY_APP_PW | LINK_URL | LINK_DISPLAY_TEXT | HASHTAGS |
 #  MEGA_UPLOAD_FOLDER | MEGA_PROCESSED_FOLDER |
 #  LOCKED_BY | LOCKED_AT   (optional) |
-#  ACCOUNT_STATUS | ACCOUNT_STATUS_AT   (optional — auto-updated: "Active"
-#                         after every successful login, or a ban/auth-fail
-#                         reason if the account gets taken down) |
+#  ACCOUNT_STATUS | ACCOUNT_STATUS_AT   (optional) |
 #  ASSIGNED_REPO | ASSIGNED_STATUS | ASSIGNED_AT   (optional) |
-#  POST_PLAN_SHEET_NAME  (optional — set a per-account post-plan tab name;
-#                         falls back to the Settings tab value, then "Sheet1")
+#  POST_PLAN_SHEET_NAME  (optional) | LINK_PLAN_SHEET_NAME  (optional)
 #
 #  Any of the "live settings" below can ALSO be set per-row in Sheet1 (as an
 #  extra column with the same name) to override the shared Settings tab
 #  value for just that one account:
 #
-#  IMAGE_RATIO | VIDEO_RATIO | HASHTAGS_ENABLED_IMAGE | HASHTAGS_ENABLED_VIDEO |
+#  IMAGE_RATIO | VIDEO_RATIO | LINK_RATIO |
+#  HASHTAGS_ENABLED_IMAGE | HASHTAGS_ENABLED_VIDEO | HASHTAGS_ENABLED_LINK |
 #  LINK_ENABLED_IMAGE | LINK_ENABLED_VIDEO | LINK_PERCENTAGE | MAX_IMAGE_MB |
-#  CAPTION_ENABLED | ENABLE_REPORT | REPORT_TIMES_PER_DAY | TOP_POSTS_COUNT |
-#  TOP_POSTS_WITHIN | POST_PLAN_SHEET_NAME | LOOP_INTERVAL_SECONDS
-
-CREDS_RANGE = f"{CREDS_TAB}!A:Z"
+#  CAPTION_ENABLED | AUTO_CAPTION_ENABLED_LINK | PREVIEW_FETCH_TIMEOUT |
+#  MAX_THUMB_MB | ENABLE_REPORT | REPORT_TIMES_PER_DAY | TOP_POSTS_COUNT |
+#  TOP_POSTS_WITHIN | POST_PLAN_SHEET_NAME | LINK_PLAN_SHEET_NAME |
+#  LOOP_INTERVAL_SECONDS
+#
+#  NOTE on LINK_RATIO: it defaults to 0 (previewLink posting OFF) so that
+#  existing sheets with only IMAGE_RATIO/VIDEO_RATIO set keep behaving
+#  exactly as before. Set LINK_RATIO to a number > 0 in the Settings tab
+#  (or per-row in Sheet1) to start mixing previewLink posts in — e.g.
+#  IMAGE_RATIO=50, VIDEO_RATIO=30, LINK_RATIO=20 gives a 50/30/20 split.
+#  The three values are normalized together, so they don't need to add to
+#  100 exactly.
 
 _account_config         = None
 _creds_lock_col_by      = None
@@ -343,11 +374,16 @@ def load_account_config(force_refresh=False):
     link_url     = raw_link if raw_link.startswith("http") else f"https://{raw_link}"
     link_display = col("LINK_DISPLAY_TEXT") or link_url.replace("https://","").replace("http://","")
 
-    img_ratio_raw = _parse_pct(setting("IMAGE_RATIO"), 0.60)
-    vid_ratio_raw = _parse_pct(setting("VIDEO_RATIO"), 0.40)
-    ratio_sum     = img_ratio_raw + vid_ratio_raw
-    image_ratio   = (img_ratio_raw / ratio_sum) if ratio_sum > 0 else 0.60
-    video_ratio   = (vid_ratio_raw / ratio_sum) if ratio_sum > 0 else 0.40
+    img_ratio_raw  = _parse_pct(setting("IMAGE_RATIO"), 0.60)
+    vid_ratio_raw  = _parse_pct(setting("VIDEO_RATIO"), 0.40)
+    link_ratio_raw = _parse_pct(setting("LINK_RATIO"), 0.0)
+    ratio_sum      = img_ratio_raw + vid_ratio_raw + link_ratio_raw
+    if ratio_sum > 0:
+        image_ratio = img_ratio_raw / ratio_sum
+        video_ratio = vid_ratio_raw / ratio_sum
+        link_ratio  = link_ratio_raw / ratio_sum
+    else:
+        image_ratio, video_ratio, link_ratio = 0.60, 0.40, 0.0
 
     cfg = {
         "handle":                col("BSKY_HANDLE"),
@@ -360,19 +396,25 @@ def load_account_config(force_refresh=False):
         "row_num":               ACCOUNT_ROW,
 
         "image_ratio":              image_ratio,
-        "video_ratio":              video_ratio,
+        "video_ratio":               video_ratio,
+        "link_ratio":                link_ratio,
         "hashtags_enabled_image":   _parse_bool(setting("HASHTAGS_ENABLED_IMAGE"), True),
         "hashtags_enabled_video":   _parse_bool(setting("HASHTAGS_ENABLED_VIDEO"), False),
+        "hashtags_enabled_link":    _parse_bool(setting("HASHTAGS_ENABLED_LINK"), True),
         "link_enabled_image":       _parse_bool(setting("LINK_ENABLED_IMAGE"), True),
         "link_enabled_video":       _parse_bool(setting("LINK_ENABLED_VIDEO"), True),
         "link_percentage":          _parse_pct(setting("LINK_PERCENTAGE"), 1.0),
         "max_image_bytes":          int(_parse_plain_float(setting("MAX_IMAGE_MB"), 2.0) * 1024 * 1024),
         "caption_enabled":          _parse_bool(setting("CAPTION_ENABLED"), True),
+        "auto_caption_enabled_link": _parse_bool(setting("AUTO_CAPTION_ENABLED_LINK"), True),
+        "preview_timeout":          _parse_int(setting("PREVIEW_FETCH_TIMEOUT"), 15),
+        "max_thumb_bytes":          int(_parse_plain_float(setting("MAX_THUMB_MB"), 1.0) * 1024 * 1024),
         "enable_report":            _parse_bool(setting("ENABLE_REPORT"), False),
         "report_times_per_day":     _parse_int(setting("REPORT_TIMES_PER_DAY"), 1),
         "top_posts_count":          _parse_int(setting("TOP_POSTS_COUNT"), 1),
         "top_posts_within":         _parse_int(setting("TOP_POSTS_WITHIN"), 30),
         "post_plan_sheet_name":     setting("POST_PLAN_SHEET_NAME") or "Sheet1",
+        "link_plan_sheet_name":     setting("LINK_PLAN_SHEET_NAME") or "LinkPlan",
         "loop_interval_seconds":    _parse_int(setting("LOOP_INTERVAL_SECONDS"),
                                                 DEFAULT_LOOP_INTERVAL_SECONDS),
 
@@ -451,9 +493,7 @@ def try_acquire_account_lock():
 
 def _write_account_status(status):
     """Writes a human-readable status directly onto this account's own
-    Sheet1 row (e.g. 'Active', 'Banned', 'Auth Failed'), so you can see at
-    a glance which accounts need attention without digging through the
-    Report tab. No-op if the ACCOUNT_STATUS column doesn't exist yet."""
+    Sheet1 row (e.g. 'Active', 'Banned', 'Auth Failed')."""
     global _account_config
     if _creds_status_col is None:
         print("Note: no ACCOUNT_STATUS column in Sheet1 — add one to track per-row status.")
@@ -503,23 +543,28 @@ def print_config_summary():
     print(f"  Account status:           {cfg.get('account_status') or '(not set)'}")
     print(f"  Mega upload folder:       {cfg['mega_upload_folder'] or '(not set!)'}")
     print(f"  Mega processed folder:    {cfg['mega_processed_folder'] or '(not set!)'}")
-    print(f"  Post link:                {cfg['link_display_text']} -> {cfg['link_url']}")
-    print(f"  Image ratio:              {cfg['image_ratio']:.0%}")
-    print(f"  Video ratio:              {cfg['video_ratio']:.0%}")
+    print(f"  Post link (in-caption):   {cfg['link_display_text']} -> {cfg['link_url']}")
+    print(f"  Post-type mix:            image {cfg['image_ratio']:.0%} / "
+          f"video {cfg['video_ratio']:.0%} / previewLink {cfg['link_ratio']:.0%}")
     print(f"  Caption enabled:          {cfg['caption_enabled']}")
     print(f"  Hashtags on image posts:  {cfg['hashtags_enabled_image']}")
     print(f"  Hashtags on video posts:  {cfg['hashtags_enabled_video']}")
+    print(f"  Hashtags on previewLink:  {cfg['hashtags_enabled_link']}")
     print(f"  Link on image posts:      {cfg['link_enabled_image']}")
     print(f"  Link on video posts:      {cfg['link_enabled_video']}")
-    print(f"  Link inclusion rate:      {cfg['link_percentage']:.0%} of eligible posts")
+    print(f"  Link inclusion rate:      {cfg['link_percentage']:.0%} of eligible image/video posts")
     print(f"  Max image size:           {cfg['max_image_bytes']/(1024*1024):.2f} MB")
+    print(f"  previewLink auto-caption: {cfg['auto_caption_enabled_link']} (title+description when sheet has none)")
+    print(f"  previewLink fetch timeout:{cfg['preview_timeout']}s")
+    print(f"  previewLink max thumb:    {cfg['max_thumb_bytes']/(1024*1024):.2f} MB")
     print(f"  Loop interval:            {cfg['loop_interval_seconds']}s ({cfg['loop_interval_seconds']/60:.1f} min)")
     print(f"  Generate report:          {cfg['enable_report']}")
     if cfg["enable_report"]:
         print(f"  Report frequency:         {cfg['report_times_per_day']}x per 24h")
         print(f"  Top posts combined:       {cfg['top_posts_count']}")
         print(f"  Scan last N posts:        {cfg['top_posts_within']}")
-    print(f"  Post-plan tab:            {cfg['post_plan_sheet_name']}")
+    print(f"  Post-plan tab (media):    {cfg['post_plan_sheet_name']}")
+    print(f"  LinkPlan tab (previewLink): {cfg['link_plan_sheet_name']}")
     print(f"  Google auth:              service account (GOOGLE_APPLICATION_CREDENTIALS)")
     if _creds_lock_col_by is not None:
         print(f"  Cross-repo lock:          enabled (owner={cfg.get('locked_by') or '—'}, "
@@ -530,9 +575,7 @@ def print_config_summary():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  REPORT TAB — simplified: ONE row per check-in, plain-English columns,
-#  frequency controlled by REPORT_TIMES_PER_DAY instead of a hardcoded
-#  once-per-calendar-day check.
+#  REPORT TAB (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _now_str():
@@ -579,8 +622,6 @@ def _ensure_report_tab(service):
 
 
 def _last_report_for_handle(service, handle):
-    """Returns (timestamp_str, followers_int_or_None) for the most recent
-    report row for this handle, or (None, None) if there isn't one yet."""
     try:
         result = service.spreadsheets().values().get(
             spreadsheetId=MASTER_SHEET_ID, range=f"{REPORT_TAB}!A:G"
@@ -624,8 +665,6 @@ def _append_report(service, rows):
 
 
 def _top_post_summary(client, handle, top_n, within):
-    """Returns (summary_text, top_engagement_int). Combines up to top_n
-    posts into one readable cell instead of writing extra rows."""
     try:
         response = client.get_author_feed(actor=handle, limit=within)
     except Exception as exc:
@@ -708,7 +747,10 @@ class AccountTakenDownError(Exception):
     """Fatal — log to sheet, disable workflow."""
 
 class NoMediaFoundError(Exception):
-    """Clean exit (code 0) — keep schedule running."""
+    """Clean exit (code 0) — nothing postable this cycle; keep schedule running."""
+
+class NoPreviewError(Exception):
+    """Link-preview metadata could not be fetched via cardyb or manual scrape."""
 
 
 def log_account_problem(handle, status):
@@ -750,7 +792,8 @@ def get_account_hashtags():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  LINK-IN-POST DECISION
+#  LINK-IN-POST DECISION (unrelated to the previewLink post type — this is
+#  the "append a CTA link" toggle inside image/video captions)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def should_add_link(kind):
@@ -762,7 +805,21 @@ def should_add_link(kind):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  POST-PLAN SHEET (unchanged — still File Name + Caption + Status)
+#  POST-TYPE SELECTION — image / video / previewLink, weighted by the
+#  normalized IMAGE_RATIO / VIDEO_RATIO / LINK_RATIO settings.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def choose_media_kind():
+    cfg = _cfg()
+    return random.choices(
+        ["image", "video", "previewLink"],
+        weights=[cfg["image_ratio"], cfg["video_ratio"], cfg["link_ratio"]],
+        k=1,
+    )[0]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  POST-PLAN SHEET (File Name + Caption + Status) — image/video media
 # ═══════════════════════════════════════════════════════════════════════════
 
 _post_plan_cache          = None
@@ -868,9 +925,334 @@ def mark_posted(filename, row_number, retries=3):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  MEGA.NZ HELPERS (via rclone) — replaces the old Google Drive section.
-#  Same claim/download/post/move-to-processed flow as before, just backed
-#  by rclone commands against the Mega remote instead of the Drive API.
+#  LINKPLAN SHEET (URL + Caption + Status) — previewLink posts. Same
+#  claim/post/mark-posted pattern as the post-plan sheet above, just keyed
+#  on URL instead of a media filename (there's no file to download).
+# ═══════════════════════════════════════════════════════════════════════════
+
+def get_link_plan_tab_name():
+    return _cfg()["link_plan_sheet_name"]
+
+
+def load_link_plan(service):
+    tab = get_link_plan_tab_name()
+    values = service.spreadsheets().values().get(
+        spreadsheetId=LINK_PLAN_SHEET_ID, range=f"{tab}!A:C"
+    ).execute().get("values", [])
+    if len(values) < 2:
+        return []
+    header = [h.strip().lower() for h in values[0]]
+    def ci(*names):
+        for n in names:
+            if n in header:
+                return header.index(n)
+        return None
+    url_idx, cap_idx, status_idx = ci("url"), ci("caption"), ci("status")
+    if url_idx is None:
+        raise RuntimeError(f"'{tab}' needs a 'URL' column.")
+
+    rows = []
+    for i, row in enumerate(values[1:], start=2):
+        url = row[url_idx].strip() if len(row) > url_idx else ""
+        if not url:
+            continue
+        caption = row[cap_idx].strip() if cap_idx is not None and len(row) > cap_idx else ""
+        status  = row[status_idx].strip() if status_idx is not None and len(row) > status_idx else ""
+        rows.append({"url": url, "caption": caption, "status": status, "row": i, "status_col": status_idx})
+    return rows
+
+
+def pick_next_url(service):
+    plan = load_link_plan(service)
+    for entry in plan:
+        s = entry["status"].lower()
+        if s == POSTED_STATUS_VALUE or s.startswith(CLAIM_PREFIX.lower()):
+            continue
+        return entry
+    return None
+
+
+def claim_url_row(service, entry):
+    """Soft-claims a row by writing CLAIMED_<runtag> into Status, so two
+    concurrent runners don't grab the same URL. Returns True if the claim
+    stuck (nobody else claimed it first)."""
+    if entry["status_col"] is None:
+        return True
+    tab = get_link_plan_tab_name()
+    col_l = _col_letter(entry["status_col"])
+    claim_val = f"{CLAIM_PREFIX}{RUN_TAG}"
+    service.spreadsheets().values().update(
+        spreadsheetId=LINK_PLAN_SHEET_ID, range=f"{tab}!{col_l}{entry['row']}",
+        valueInputOption="RAW", body={"values": [[claim_val]]},
+    ).execute()
+    check = service.spreadsheets().values().get(
+        spreadsheetId=LINK_PLAN_SHEET_ID, range=f"{tab}!{col_l}{entry['row']}"
+    ).execute().get("values", [[""]])
+    return check[0][0].strip() == claim_val if check else False
+
+
+def mark_url_posted(service, entry):
+    if entry["status_col"] is None:
+        return
+    tab = get_link_plan_tab_name()
+    col_l = _col_letter(entry["status_col"])
+    service.spreadsheets().values().update(
+        spreadsheetId=LINK_PLAN_SHEET_ID, range=f"{tab}!{col_l}{entry['row']}",
+        valueInputOption="RAW", body={"values": [[POSTED_STATUS_VALUE]]},
+    ).execute()
+
+
+def release_url_claim(service, entry):
+    if entry["status_col"] is None:
+        return
+    try:
+        tab = get_link_plan_tab_name()
+        col_l = _col_letter(entry["status_col"])
+        service.spreadsheets().values().update(
+            spreadsheetId=LINK_PLAN_SHEET_ID, range=f"{tab}!{col_l}{entry['row']}",
+            valueInputOption="RAW", body={"values": [[""]]},
+        ).execute()
+    except Exception as exc:
+        print(f"Warning: could not release claim on LinkPlan row {entry['row']}: {exc}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  LINK PREVIEW (og:title / og:description / og:image) for previewLink posts
+#
+#  PRIMARY PATH: Bluesky's own card-generation service, cardyb
+#  (https://cardyb.bsky.app/v1/extract) — the same backend the official
+#  Bluesky app/web client hits when you paste a link into the composer.
+#  FALLBACK PATH: manually scrape the page's own <meta> tags if cardyb is
+#  unreachable or returns nothing usable after retries.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def fetch_link_metadata(url, timeout=20):
+    last_exc = None
+    for attempt in range(1, LINK_PREVIEW_MAX_RETRIES + 1):
+        try:
+            resp = requests.get(
+                CARDYB_EXTRACT_URL,
+                params={"url": url},
+                headers=REQUEST_HEADERS,
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return {
+                "title": (data.get("title") or url)[:300],
+                "description": (data.get("description") or "")[:1000],
+                "image": data.get("image") or None,
+                "final_url": url,
+            }
+        except (requests.exceptions.RequestException, ValueError) as exc:
+            last_exc = exc
+            print(f"Attempt {attempt}/{LINK_PREVIEW_MAX_RETRIES} to fetch via cardyb failed: {exc}")
+            if attempt < LINK_PREVIEW_MAX_RETRIES:
+                delay = LINK_PREVIEW_RETRY_DELAY * (2 ** (attempt - 1))
+                print(f"Retrying in {delay}s…")
+                time.sleep(delay)
+
+    print(f"cardyb extraction failed after {LINK_PREVIEW_MAX_RETRIES} attempts ({last_exc}); "
+          f"falling back to manual scrape.")
+    return _fetch_link_metadata_manual(url, timeout)
+
+
+def _fetch_link_metadata_manual(url, timeout=20):
+    last_exc = None
+    for attempt in range(1, LINK_PREVIEW_MAX_RETRIES + 1):
+        try:
+            resp = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout, allow_redirects=True)
+            resp.raise_for_status()
+            return _parse_link_metadata(resp)
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            print(f"Attempt {attempt}/{LINK_PREVIEW_MAX_RETRIES} to manually fetch {url} failed: {exc}")
+            if attempt < LINK_PREVIEW_MAX_RETRIES:
+                delay = LINK_PREVIEW_RETRY_DELAY * (2 ** (attempt - 1))
+                print(f"Retrying in {delay}s…")
+                time.sleep(delay)
+
+    raise NoPreviewError(f"Failed to fetch {url} after {LINK_PREVIEW_MAX_RETRIES} attempts (cardyb + manual)") from last_exc
+
+
+def _parse_link_metadata(resp):
+    soup = BeautifulSoup(resp.text, "html.parser")
+    final_url = resp.url
+
+    def meta(*props):
+        for prop in props:
+            tag = soup.find("meta", property=prop) or soup.find("meta", attrs={"name": prop})
+            if tag and tag.get("content"):
+                return tag["content"].strip()
+        return None
+
+    title = meta("og:title", "twitter:title") or (
+        soup.title.string.strip() if soup.title and soup.title.string else resp.url
+    )
+    description = meta("og:description", "twitter:description", "description") or ""
+    raw_image = meta("og:image", "og:image:url", "twitter:image")
+    image = urljoin(final_url, raw_image) if raw_image else None
+
+    return {"title": title[:300], "description": description[:1000], "image": image, "final_url": final_url}
+
+
+def upload_link_thumbnail(client, image_url, referer, max_bytes, timeout=20):
+    """Download the preview image (if any) and upload it as a blob for the
+    card, retrying transient failures and shrinking it if it's over size."""
+    if not image_url:
+        print("No preview image found — posting without a thumbnail.")
+        return None
+
+    headers = {**REQUEST_HEADERS, "Referer": referer}
+    last_exc = None
+    for attempt in range(1, LINK_PREVIEW_MAX_RETRIES + 1):
+        try:
+            img_resp = requests.get(image_url, headers=headers, timeout=timeout)
+            img_resp.raise_for_status()
+            content_type = img_resp.headers.get("Content-Type", "")
+            if "image" not in content_type:
+                print(f"Warning: fetched image URL did not return an image (Content-Type: {content_type!r})")
+                return None
+
+            data = img_resp.content
+            if len(data) > max_bytes:
+                data = _compress_link_thumb(data, max_bytes)
+                if data is None:
+                    return None
+
+            upload = client.upload_blob(data)
+            return upload.blob
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            print(f"Attempt {attempt}/{LINK_PREVIEW_MAX_RETRIES} to fetch/upload thumbnail failed: {exc}")
+            if attempt < LINK_PREVIEW_MAX_RETRIES:
+                delay = LINK_PREVIEW_RETRY_DELAY * (2 ** (attempt - 1))
+                print(f"Retrying in {delay}s…")
+                time.sleep(delay)
+
+    print(f"Warning: thumbnail could not be fetched/uploaded after all retries ({last_exc}); posting without one.")
+    return None
+
+
+def _compress_link_thumb(data, max_bytes):
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(data))
+        if img.mode in ("RGBA", "P", "LA"):
+            img = img.convert("RGB")
+        for q in range(85, 20, -10):
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=q, optimize=True)
+            if buf.tell() <= max_bytes:
+                return buf.getvalue()
+        return buf.getvalue()
+    except Exception as exc:
+        print(f"Warning: could not compress thumbnail: {exc}")
+        return None
+
+
+MAX_POST_GRAPHEMES = 300
+
+def build_link_caption_text(caption, tags, fallback_url=None):
+    # NOTE: strip only spaces/tabs here, not newlines — compose_fallback_caption
+    # intentionally prepends a leading "\n" before the title, and a plain
+    # .strip() would silently remove it.
+    text = _URL_RE.sub("", caption or "").strip(" \t\r")
+    if fallback_url:
+        text = f"{text}\n{fallback_url}".strip(" \t\r") if text else fallback_url
+
+    tb = TextBuilder()
+    if text:
+        tb.text(text)
+    if tags:
+        if text:
+            tb.text("\n\n")
+        for i, tag in enumerate(tags):
+            tb.tag(f"#{tag}", tag)
+            if i < len(tags) - 1:
+                tb.text(" ")
+
+    plain = tb.build_text()
+    if len(plain) > MAX_POST_GRAPHEMES:
+        hashtag_block = ("\n\n" + " ".join(f"#{t}" for t in tags)) if tags else ""
+        budget = MAX_POST_GRAPHEMES - len(hashtag_block)
+        trimmed = (text[:max(0, budget - 1)].rstrip() + "…") if budget > 0 else ""
+        tb = TextBuilder()
+        if trimmed:
+            tb.text(trimmed)
+        if tags:
+            if trimmed:
+                tb.text("\n\n")
+            for i, tag in enumerate(tags):
+                tb.tag(f"#{tag}", tag)
+                if i < len(tags) - 1:
+                    tb.text(" ")
+    return tb
+
+
+def build_external_embed(client, preview, max_thumb_bytes, timeout):
+    thumb_blob = upload_link_thumbnail(
+        client, preview["image"], referer=preview["final_url"],
+        max_bytes=max_thumb_bytes, timeout=timeout,
+    )
+    return models.AppBskyEmbedExternal.Main(
+        external=models.AppBskyEmbedExternal.External(
+            uri=preview["final_url"],
+            title=preview["title"],
+            description=preview["description"],
+            thumb=thumb_blob,
+        )
+    )
+
+
+def compose_fallback_caption(preview):
+    """When the sheet has no Caption for a row, build one from the fetched
+    preview instead: a blank line, then og:title, then description
+    directly underneath. Hashtags still get appended after this block."""
+    if not preview:
+        return ""
+    title = (preview.get("title") or "").strip()
+    description = (preview.get("description") or "").strip()
+    parts = [p for p in (title, description) if p]
+    if not parts:
+        return ""
+    return "\n" + "\n".join(parts)
+
+
+def post_link_card(client, url, caption, tags, timeout, max_thumb_bytes, auto_caption_enabled=True):
+    print(f"[previewLink] Fetching preview for: {url}")
+    preview = None
+    embed = None
+    try:
+        preview = fetch_link_metadata(url, timeout)
+        print(f"  title: {preview['title']!r}")
+        embed = build_external_embed(client, preview, max_thumb_bytes, timeout)
+    except Exception as exc:
+        # Don't let a bad preview fetch kill the whole cycle — fall back
+        # to a plain post that still includes the link as text.
+        print(f"Warning: preview fetch failed ({exc}); posting as plain link instead.")
+
+    used_auto_caption = False
+    effective_caption = caption
+    if not effective_caption and preview and auto_caption_enabled:
+        effective_caption = compose_fallback_caption(preview)
+        used_auto_caption = bool(effective_caption)
+        if used_auto_caption:
+            print("No Caption in sheet — using title + description from the preview instead.")
+    elif not effective_caption and preview and not auto_caption_enabled:
+        print("No Caption in sheet and previewLink auto-caption is off — posting without a caption.")
+
+    tb = build_link_caption_text(effective_caption, tags, fallback_url=(url if preview is None else None))
+    client.send_post(text=tb, embed=embed)
+
+    posted_url = preview["final_url"] if preview else url
+    caption_source = "auto (title+description)" if used_auto_caption else ("sheet" if caption else "no")
+    print(f"✓ Posted {'link card' if embed else 'plain link'} for {posted_url} "
+          f"(caption={caption_source}, tags={len(tags)})")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  MEGA.NZ HELPERS (via rclone) — image/video media
 # ═══════════════════════════════════════════════════════════════════════════
 
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".avif", ".heic"}
@@ -884,11 +1266,6 @@ def _kind_from_filename(filename):
     if ext in _VIDEO_EXTS:
         return "video"
     return None
-
-
-def choose_media_kind():
-    cfg = _cfg()
-    return random.choices(["image", "video"], weights=[cfg["image_ratio"], cfg["video_ratio"]], k=1)[0]
 
 
 def _rclone_run(args):
@@ -1020,10 +1397,8 @@ def release_claim(claimed_name, original_name):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  POST BUILDING
+#  IMAGE/VIDEO POST BUILDING
 # ═══════════════════════════════════════════════════════════════════════════
-
-MAX_POST_GRAPHEMES = 300
 
 def build_post_from_caption(caption, tags, add_link):
     cfg  = _cfg()
@@ -1107,7 +1482,8 @@ def post_to_bluesky(client, media_name, local_path, kind, caption, tags, add_lin
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  MAIN CYCLE
+#  MAIN CYCLE — one account row, one post per cycle, picked as
+#  image / video / previewLink by the ratio settings.
 # ═══════════════════════════════════════════════════════════════════════════
 
 def run_once():
@@ -1139,12 +1515,45 @@ def run_once():
     if cfg["enable_report"]:
         run_report(client, handle, cfg)
 
+    preferred = choose_media_kind()
+    print(f"Post-type chosen for this cycle: {preferred}")
+
+    # ── previewLink path ────────────────────────────────────────────────
+    if preferred == "previewLink":
+        sheets_service = get_sheets_service()
+        entry = pick_next_url(sheets_service)
+        if entry is None:
+            print("No unposted rows left in LinkPlan — falling back to image/video this cycle.")
+            preferred = random.choice(["image", "video"])
+        else:
+            if not claim_url_row(sheets_service, entry):
+                print("Lost claim race on this LinkPlan row; will try again next cycle.")
+                return
+
+            tags = get_account_hashtags() if cfg["hashtags_enabled_link"] else []
+            try:
+                post_link_card(
+                    client, entry["url"], entry["caption"], tags,
+                    cfg["preview_timeout"], cfg["max_thumb_bytes"],
+                    auto_caption_enabled=cfg["auto_caption_enabled_link"],
+                )
+            except Exception as exc:
+                err = str(exc)
+                release_url_claim(sheets_service, entry)
+                if "AccountTakedown" in err or "AccountSuspended" in err:
+                    raise AccountTakenDownError(f"Account {handle} taken down mid-cycle.") from exc
+                print(f"previewLink post failed for {entry['url']} — claim released: {exc}")
+                raise
+
+            mark_url_posted(sheets_service, entry)
+            return  # cycle complete
+
+    # ── image/video path (existing Mega-backed flow) ────────────────────
     plan = load_post_plan()
     if not plan:
         raise NoMediaFoundError("Post-plan sheet has no usable rows.")
 
-    preferred = choose_media_kind()
-    fallback  = "video" if preferred == "image" else "image"
+    fallback = "video" if preferred == "image" else "image"
 
     file, path, kind, caption, row_num = fetch_media_matching_plan(preferred, plan)
     if not file:
@@ -1196,9 +1605,9 @@ def main():
         sys.exit(1)
 
     print_config_summary()
-    print(f"Starting loop. Loop interval is read from the Settings tab "
-          f"(LOOP_INTERVAL_SECONDS) and re-checked at the start of every cycle "
-          f"— edit it in Google Sheets any time, no redeploy needed.")
+    print(f"Starting loop. Loop interval and post-type mix are read from the "
+          f"Settings tab and re-checked at the start of every cycle — edit "
+          f"them in Google Sheets any time, no redeploy needed.")
 
     while True:
         cycle_start = time.time()
