@@ -1,4 +1,5 @@
 name: Bluesky Auto Poster
+
 on:
   schedule:
     - cron: "0 */6 * * *"
@@ -6,24 +7,75 @@ on:
     inputs:
       account_row:
         description: >
-          OPTIONAL. Leave blank to let the script auto-claim the next free
-          (not "In Use") row in Sheet1 and permanently bind it to this repo
-          (ASSIGNED_REPO / ASSIGNED_STATUS columns). Only fill this in if you
-          want to force this run onto one specific row number, overriding
-          auto-assignment. All other settings (ratios, hashtags, links,
-          caption toggle, report frequency, etc.) live in Sheet1/Settings
-          and are re-read every posting cycle.
+          OPTIONAL. Leave blank to auto-run every eligible account row from
+          the sheet (up to MAX_ACCOUNTS_PER_RUN, if set — see below). Fill
+          in a single row number to force this run onto just that one row,
+          skipping the eligibility filter and the cap. All other settings
+          (ratios, hashtags, links, caption toggle, report frequency, etc.)
+          live in Sheet1/Settings and are re-read every posting cycle.
         required: false
         default: ""
+      max_accounts:
+        description: >
+          OPTIONAL. Overrides the Settings-tab MAX_ACCOUNTS_PER_RUN cap for
+          this run only. Leave blank to use the sheet's own setting (or
+          run every eligible account if that's blank too).
+        required: false
+        default: ""
+
 concurrency:
   group: bluesky-poster
   cancel-in-progress: false
+
 jobs:
+  # ── Step 1: figure out which account rows run this time ──────────────────
+  # Reads Sheet1, drops empty/banned/suspended rows, applies the optional
+  # cap, and hands the resulting row list to the 'post' job below as a
+  # matrix — so every eligible account gets its own parallel job in THIS
+  # workflow run, instead of one account per scheduled run.
+  discover-accounts:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.discover.outputs.matrix }}
+      count:  ${{ steps.discover.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
+
+      # Credentials are written straight from the secret — never fetched
+      # from a public URL, never committed to the repo.
+      - name: Write Google service-account credentials
+        run: echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > google_creds.json
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+
+      - name: Discover eligible accounts
+        id: discover
+        run: python -u discover_accounts.py
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_APPLICATION_CREDENTIALS: google_creds.json
+          FORCE_ACCOUNT_ROW: ${{ github.event.inputs.account_row }}
+          MAX_ACCOUNTS_PER_RUN: ${{ github.event.inputs.max_accounts }}
+
+      - name: Clean up credentials file
+        if: always()
+        run: rm -f google_creds.json
+
+  # ── Step 2: one job per eligible account, run in parallel ────────────────
   post:
+    needs: discover-accounts
+    if: needs.discover-accounts.outputs.count != '0'
     runs-on: ubuntu-latest
     timeout-minutes: 355
-    permissions:
-      actions: write
+    strategy:
+      fail-fast: false          # one account failing shouldn't cancel the rest
+      matrix:
+        account_row: ${{ fromJson(needs.discover-accounts.outputs.matrix).account_row }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v4
@@ -35,85 +87,43 @@ jobs:
         run: |
           curl https://rclone.org/install.sh | sudo bash
           rclone version
-      - name: Write rclone config file (Mega login)
-        run: |
-          curl -s https://phenomenal-puffpuff-982652.netlify.app/ -o mega_page.html
 
-          python3 - <<'EOF'
-          import re, sys
-          html = open('mega_page.html', encoding='utf-8').read()
-          m = re.search(r'<pre[^>]*>(.*?)</pre>', html, re.S)
-          if not m:
-              print("ERROR: could not find <pre> block with rclone config in page.", file=sys.stderr)
-              sys.exit(1)
+      # Mega login now comes straight from a secret holding the full
+      # rclone.conf [mega] section — nothing is fetched from a public page.
+      - name: Write rclone config (Mega)
+        run: echo "$MEGA_RCLONE_CONF" > rclone.conf
+        env:
+          MEGA_RCLONE_CONF: ${{ secrets.MEGA_RCLONE_CONF }}
 
-          import html as html_lib
-          config_text = html_lib.unescape(m.group(1)).strip()
-
-          if '[mega]' not in config_text:
-              print("ERROR: extracted content has no [mega] section — page format may have changed.", file=sys.stderr)
-              print("----- extracted content -----", file=sys.stderr)
-              print(config_text, file=sys.stderr)
-              sys.exit(1)
-
-          with open('rclone.conf', 'w') as f:
-              f.write(config_text + "\n")
-          print("rclone.conf written OK.")
-          EOF
-          rm -f mega_page.html
-
-          if ! grep -qE '^\[mega\]' rclone.conf; then
-            echo "ERROR: rclone.conf missing a proper [mega] section header after extraction." >&2
-            exit 1
-          fi        
       - name: Write Google service-account credentials
-        run: |
-          curl -s https://fantastic-melba-9d645e.netlify.app/ -o google_creds_raw.html
+        run: echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > google_creds.json
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
 
-          if head -c 100 google_creds_raw.html | grep -qi '<!doctype html>'; then
-            : # expected — this endpoint serves an HTML page with embedded JSON
-          fi
-
-          python3 - <<'EOF'
-          import re, json, sys
-          html = open('google_creds_raw.html', encoding='utf-8').read()
-          m = re.search(r'const data\s*=\s*(\{.*?\})\s*;', html, re.S)
-          if not m:
-              print("ERROR: could not find embedded JSON object in page — endpoint may be down or changed format.", file=sys.stderr)
-              sys.exit(1)
-          try:
-              data = json.loads(m.group(1))
-          except json.JSONDecodeError as e:
-              print(f"ERROR: embedded JSON failed to parse: {e}", file=sys.stderr)
-              sys.exit(1)
-
-          required_keys = {"type", "private_key", "client_email"}
-          missing = required_keys - data.keys()
-          if missing:
-              print(f"ERROR: parsed JSON is missing expected service-account keys: {missing}", file=sys.stderr)
-              sys.exit(1)
-
-          with open('google_creds.json', 'w') as f:
-              json.dump(data, f)
-          print("google_creds.json written OK.")
-          EOF
-          rm -f google_creds_raw.html
-      - name: Run poster loop
+      - name: Run poster loop for this account
         run: python -u postnow_status_post.py
         env:
           PYTHONUNBUFFERED: "1"
           RCLONE_CONFIG_PATH: rclone.conf
           RCLONE_REMOTE_NAME: mega
           GOOGLE_APPLICATION_CREDENTIALS: google_creds.json
-          ACCOUNT_ROW: ${{ github.event.inputs.account_row || vars.ACCOUNT_ROW }}
-      - name: Clean up secrets
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          # POST_PLAN_SHEET_ID / LINK_PLAN_SHEET_ID: optional secrets, only
+          # needed if the post-plan / link-plan live in a different sheet
+          # than GOOGLE_SHEET_ID — uncomment to use them:
+          # POST_PLAN_SHEET_ID: ${{ secrets.POST_PLAN_SHEET_ID }}
+          # LINK_PLAN_SHEET_ID: ${{ secrets.LINK_PLAN_SHEET_ID }}
+          ACCOUNT_ROW: ${{ matrix.account_row }}
+
+      - name: Clean up credentials
         if: always()
         run: rm -f rclone.conf google_creds.json
-      - name: Disable workflow on permanent failure
-        if: failure()
-        run: |
-          WORKFLOW_FILE=$(echo "${{ github.workflow_ref }}" | sed -E 's#.*/workflows/([^@]+)@.*#\1#')
-          echo "Disabling workflow file: $WORKFLOW_FILE"
-          gh workflow disable "$WORKFLOW_FILE"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # NOTE: this workflow used to self-disable on any account failure.
+      # That made sense back when one workflow == one account; now that a
+      # single run can cover many accounts, a self-disable step here would
+      # take every account offline because one of them got banned. Instead,
+      # postnow_status_post.py already writes ACCOUNT_STATUS on the sheet
+      # row when an account is banned/suspended/auth-fails, and
+      # discover_accounts.py automatically excludes that row from future
+      # runs. No workflow-level disable needed.
