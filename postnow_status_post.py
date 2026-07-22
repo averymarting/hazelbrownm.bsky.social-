@@ -32,12 +32,12 @@ LOCK_TTL_MINUTES = 45  # longer than the internal post loop, so an actively
 #  ENV / VALUE PARSING HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
 
-def get_env(name, required=True):
+def get_env(name, required=True, default=""):
     v = os.getenv(name)
-    if v is None:
+    if v is None or not v.strip():
         if required:
             raise RuntimeError(f"Missing required env var: {name}")
-        return ""
+        return default
     return v.strip()
 
 def _parse_bool(raw, default=False):
@@ -89,6 +89,8 @@ def get_int_env(name, default):
 ACCOUNT_ROW = get_int_env("ACCOUNT_ROW", 1)   # 1-based data row (header is row 0)
 
 # ── rclone / Mega ────────────────────────────────────────────────────────────
+# rclone.conf itself is now written by the workflow from the MEGA_RCLONE_CONF
+# secret — nothing Mega-related is hardcoded or fetched from a public URL here.
 RCLONE_CONFIG_PATH = get_env("RCLONE_CONFIG_PATH", required=False) or "rclone.conf"
 RCLONE_REMOTE_NAME = get_env("RCLONE_REMOTE_NAME", required=False) or "mega"
 
@@ -98,11 +100,19 @@ SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 # ═══════════════════════════════════════════════════════════════════════════
 #  SPREADSHEETS
 # ═══════════════════════════════════════════════════════════════════════════
+#
+#  All spreadsheet IDs now come from env vars (set by the workflow from
+#  repo/org secrets) instead of being hardcoded in source — nothing here
+#  reveals which Google Sheet this points at.
+#
+#  Required:  GOOGLE_SHEET_ID          (master sheet: Credentials/Settings/Report)
+#  Optional:  POST_PLAN_SHEET_ID       (defaults to GOOGLE_SHEET_ID)
+#             LINK_PLAN_SHEET_ID       (defaults to POST_PLAN_SHEET_ID)
 
 # Master sheet: Sheet1 = per-account credentials, Settings = shared live
 # knobs (image/video/previewLink ratio, hashtags, link, caption toggle,
 # report freq, etc.), Report = simplified one-row-per-check-in report.
-MASTER_SHEET_ID = "1zkyUbtpItYgw3eY1tN084PO17Y-uNBCQ5cENUK3u4rU"
+MASTER_SHEET_ID = get_env("GOOGLE_SHEET_ID")
 CREDS_TAB       = "Credentials"
 SETTINGS_TAB    = "Settings"
 REPORT_TAB      = "Report"
@@ -112,15 +122,17 @@ REPORT_TAB      = "Report"
 REPORT_HEADER = ["Timestamp (UTC)", "Handle", "Followers", "Gained", "Top Post", "Engagement", "Status"]
 
 # Post-plan sheet (separate spreadsheet) — File Name + Caption + Status,
-# used for the "image" and "video" post types (Mega-hosted media).
-POST_PLAN_SHEET_ID  = "1C28ZFsI58AKC4gWfiKLoQgpRTrVpBD_O0f9f7wsSNcM"
+# used for the "image" and "video" post types (Mega-hosted media). Falls
+# back to the master sheet ID if a dedicated one isn't set, so a single
+# GOOGLE_SHEET_ID secret is enough for a one-spreadsheet setup.
+POST_PLAN_SHEET_ID  = get_env("POST_PLAN_SHEET_ID", required=False) or MASTER_SHEET_ID
 POSTED_STATUS_VALUE = "posted"
 
 # LinkPlan sheet — URL + Caption + Status, used for the "previewLink" post
 # type (social-card / link-preview posts, no media file needed). Lives as
-# a tab in the SAME spreadsheet as the post-plan by default — set this to
-# a different spreadsheet ID if you'd rather keep it separate.
-LINK_PLAN_SHEET_ID = POST_PLAN_SHEET_ID
+# a tab in the SAME spreadsheet as the post-plan by default — set
+# LINK_PLAN_SHEET_ID if you'd rather keep it separate.
+LINK_PLAN_SHEET_ID = get_env("LINK_PLAN_SHEET_ID", required=False) or POST_PLAN_SHEET_ID
 
 ASSIGN_STATUS_IN_USE = "In Use"
 
@@ -147,6 +159,10 @@ LINK_PREVIEW_RETRY_DELAY = 2  # seconds; doubles each retry (2, 4, 8...)
 #  GOOGLE CREDENTIALS (service account — same one used by the Bluesky
 #  scraper and image scraper scripts. Needs Editor access on BOTH the
 #  master sheet and the post-plan/link-plan sheet.)
+#
+#  The credentials JSON itself is written to disk by the workflow from the
+#  GOOGLE_SERVICE_ACCOUNT_JSON secret before this script runs — this file
+#  never fetches it from anywhere.
 # ═══════════════════════════════════════════════════════════════════════════
 
 def get_sheets_service():
@@ -288,6 +304,9 @@ def _claim_account_row(service, data_idx, repo_idx, status_idx, at_idx):
 #  IMAGE_RATIO=50, VIDEO_RATIO=30, LINK_RATIO=20 gives a 50/30/20 split.
 #  The three values are normalized together, so they don't need to add to
 #  100 exactly.
+#
+#  NOTE on MAX_ACCOUNTS_PER_RUN: this is read by discover_accounts.py (the
+#  workflow's matrix-building step), not by this script — see that file.
 
 _account_config         = None
 _creds_lock_col_by      = None
@@ -1628,10 +1647,11 @@ def main():
             print(f"\n{'='*60}\n{err_str}\n→ {reason}\n{'='*60}\n")
             _write_account_status(reason)
             log_account_problem(handle, status=reason)
-            # Marker file, checked by the workflow's disable step — this
-            # specifically means "this account is done, stop scheduling
-            # runs for it", as opposed to a transient failure that should
-            # just retry next scheduled run.
+            # Marker file for local/manual debugging. NOTE: this account is
+            # excluded from FUTURE runs via ACCOUNT_STATUS in the sheet
+            # (discover_accounts.py skips banned/suspended/auth-failed rows)
+            # — the workflow no longer disables itself on a single account's
+            # failure, since one workflow run now serves many accounts.
             with open("ACCOUNT_BANNED", "w") as f:
                 f.write(f"{handle}: {reason}\n")
             sys.exit(1)
