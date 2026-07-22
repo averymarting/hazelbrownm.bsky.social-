@@ -117,6 +117,11 @@ CREDS_TAB       = "Credentials"
 SETTINGS_TAB    = "Settings"
 REPORT_TAB      = "Report"
 
+# Any ACCOUNT_STATUS value containing one of these (case-insensitive) is
+# excluded from discovery — matches the status strings this same script
+# writes on a fatal account error (see _write_account_status()).
+SKIP_STATUS_MARKERS = ("banned", "suspended", "taken down", "auth failed")
+
 # Simplified 7-column report header — one row per report check-in, not one
 # row per followers-count plus N more rows per top post.
 REPORT_HEADER = ["Timestamp (UTC)", "Handle", "Followers", "Gained", "Top Post", "Engagement", "Status"]
@@ -305,8 +310,9 @@ def _claim_account_row(service, data_idx, repo_idx, status_idx, at_idx):
 #  The three values are normalized together, so they don't need to add to
 #  100 exactly.
 #
-#  NOTE on MAX_ACCOUNTS_PER_RUN: this is read by discover_accounts.py (the
-#  workflow's matrix-building step), not by this script — see that file.
+#  NOTE on MAX_ACCOUNTS_PER_RUN: this is read by run_discover() (the
+#  workflow's matrix-building step, invoked via `--discover`), not by the
+#  posting loop below.
 
 _account_config         = None
 _creds_lock_col_by      = None
@@ -1501,6 +1507,100 @@ def post_to_bluesky(client, media_name, local_path, kind, caption, tags, add_lin
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  DISCOVER MODE (`python postnow_status_post.py --discover`)
+#
+#  Runs once, in the workflow's 'prepare' job — merged in from the old
+#  standalone discover_accounts.py so there's only ONE script in the repo.
+#  Reads the Credentials tab, drops empty/banned/suspended rows, applies
+#  the optional MAX_ACCOUNTS_PER_RUN cap (or FORCE_ACCOUNT_ROW override),
+#  and writes a JSON matrix + count to $GITHUB_OUTPUT so the 'post' job can
+#  fan out one job per eligible account row.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def run_discover():
+    service = get_sheets_service()
+    values  = service.spreadsheets().values().get(
+        spreadsheetId=MASTER_SHEET_ID, range=CREDS_RANGE
+    ).execute().get("values", [])
+
+    if len(values) < 2:
+        print(f"::error::'{CREDS_TAB}' has no data rows — add at least one account.")
+        sys.exit(1)
+
+    header = [h.strip().upper() for h in values[0]]
+
+    def hidx(*names):
+        for n in names:
+            if n in header:
+                return header.index(n)
+        return None
+
+    handle_idx = hidx("BSKY_HANDLE")
+    status_idx = hidx("ACCOUNT_STATUS")
+
+    if handle_idx is None:
+        print(f"::error::'{CREDS_TAB}' needs a 'BSKY_HANDLE' column.")
+        sys.exit(1)
+
+    force_row = get_env("FORCE_ACCOUNT_ROW", required=False)
+    if force_row:
+        try:
+            eligible = [max(1, int(force_row))]
+        except ValueError:
+            print(f"::error::FORCE_ACCOUNT_ROW={force_row!r} is not a valid row number.")
+            sys.exit(1)
+        print(f"FORCE_ACCOUNT_ROW set — running only row {eligible[0]} "
+              f"(eligibility filter and MAX_ACCOUNTS_PER_RUN cap skipped).")
+    else:
+        eligible = []
+        for i, row in enumerate(values[1:], start=1):
+            handle = row[handle_idx].strip() if len(row) > handle_idx else ""
+            if not handle:
+                continue
+            status = (row[status_idx].strip().lower()
+                      if status_idx is not None and len(row) > status_idx else "")
+            if any(marker in status for marker in SKIP_STATUS_MARKERS):
+                print(f"Skipping row {i} ({handle}) — status: {status!r}")
+                continue
+            eligible.append(i)
+
+        if not eligible:
+            print(f"::error::No eligible account rows in '{CREDS_TAB}' "
+                  f"(all rows are empty or flagged banned/suspended).")
+            sys.exit(1)
+
+        # Cap: workflow_dispatch input takes priority; otherwise fall back
+        # to the Settings tab's MAX_ACCOUNTS_PER_RUN; blank/unset -> run all.
+        limit_raw = get_env("MAX_ACCOUNTS_PER_RUN", required=False)
+        if not limit_raw:
+            settings = load_global_settings()
+            limit_raw = settings.get("MAX_ACCOUNTS_PER_RUN", "")
+
+        if limit_raw:
+            try:
+                limit = max(1, int(limit_raw))
+                if limit < len(eligible):
+                    print(f"Capping this run to the first {limit} of "
+                          f"{len(eligible)} eligible accounts (MAX_ACCOUNTS_PER_RUN={limit}).")
+                eligible = eligible[:limit]
+            except ValueError:
+                print(f"Warning: MAX_ACCOUNTS_PER_RUN={limit_raw!r} is not a valid "
+                      f"number — running all eligible rows.")
+        else:
+            print("MAX_ACCOUNTS_PER_RUN not set — running all eligible accounts.")
+
+    print(f"Account rows for this workflow run: {eligible}")
+    matrix = {"account_row": eligible}
+
+    gh_output = os.environ.get("GITHUB_OUTPUT")
+    if not gh_output:
+        raise RuntimeError("GITHUB_OUTPUT is not set — must be run inside a GitHub Actions step.")
+    with open(gh_output, "a") as f:
+        f.write(f"matrix={json.dumps(matrix)}\n")
+        f.write(f"count={len(eligible)}\n")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  MAIN CYCLE — one account row, one post per cycle, picked as
 #  image / video / previewLink by the ratio settings.
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1649,8 +1749,8 @@ def main():
             log_account_problem(handle, status=reason)
             # Marker file for local/manual debugging. NOTE: this account is
             # excluded from FUTURE runs via ACCOUNT_STATUS in the sheet
-            # (discover_accounts.py skips banned/suspended/auth-failed rows)
-            # — the workflow no longer disables itself on a single account's
+            # (run_discover() skips banned/suspended/auth-failed rows) —
+            # the workflow no longer disables itself on a single account's
             # failure, since one workflow run now serves many accounts.
             with open("ACCOUNT_BANNED", "w") as f:
                 f.write(f"{handle}: {reason}\n")
@@ -1667,4 +1767,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--discover" in sys.argv:
+        run_discover()
+    else:
+        main()
